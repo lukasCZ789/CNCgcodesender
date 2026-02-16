@@ -18,6 +18,10 @@
   let queuedTotal = 0;
   let sentCount = 0;
 
+  // Machine position and UI zero offsets
+  let machinePos = { x: 0, y: 0, z: 0 };
+  let offsetPos = { x: 0, y: 0, z: 0 };
+
   // Current G-code file
   let currentFileName = null;
   let currentGcodeLines = [];
@@ -113,12 +117,27 @@
   }
 
   function updateMachinePosition({ x, y, z }) {
+    machinePos = { x, y, z };
     const px = $('pos-x');
     const py = $('pos-y');
     const pz = $('pos-z');
-    if (px) px.textContent = x.toFixed(3);
-    if (py) py.textContent = y.toFixed(3);
-    if (pz) pz.textContent = z.toFixed(3);
+    const dx = x - offsetPos.x;
+    const dy = y - offsetPos.y;
+    const dz = z - offsetPos.z;
+    if (px) px.textContent = dx.toFixed(3);
+    if (py) py.textContent = dy.toFixed(3);
+    if (pz) pz.textContent = dz.toFixed(3);
+  }
+
+  function setAxisHome(axis) {
+    if (!machinePos) return;
+    if (axis === 'x' || axis === 'y' || axis === 'z') {
+      offsetPos[axis] = machinePos[axis];
+    } else if (axis === 'xy') {
+      offsetPos.x = machinePos.x;
+      offsetPos.y = machinePos.y;
+    }
+    updateMachinePosition(machinePos);
   }
 
   // --- G-code parsing and 3D-ish projection drawing -----------------------
@@ -376,6 +395,44 @@
     );
   }
 
+  /**
+   * Perform a single jog move for the given axis/direction.
+   * Shared by both the on-screen JOG buttons and the keyboard shortcuts.
+   */
+  async function performJog(axis, direction) {
+    const jogStepInput = $('jog-step-input');
+    const step =
+      jogStepInput && jogStepInput.value
+        ? Number(jogStepInput.value)
+        : 1.0;
+
+    try {
+      const res = await window.electronAPI.sendJog({
+        axis,
+        direction,
+        step,
+      });
+      if (!res || res.success === false) {
+        appendTerminalLine(
+          `[ERR] Jog failed: ${
+            (res && res.error) || 'unknown error'
+          }`,
+          'error',
+        );
+        return;
+      }
+      appendTerminalLine(
+        `[OUT] JOG ${axis}${direction}${step.toFixed(3)} mm`,
+        'sent',
+      );
+    } catch (err) {
+      appendTerminalLine(
+        `[ERR] Jog failed: ${err.message || String(err)}`,
+        'error',
+      );
+    }
+  }
+
   // --- UI wiring -----------------------------------------------------------
 
   function wireUI() {
@@ -558,47 +615,100 @@
       });
     }
 
-    // Jog controls
-    const jogStepInput = $('jog-step-input');
+    // Jog controls (buttons)
     document
       .querySelectorAll('[data-jog]')
       .forEach((btn /** @type {HTMLElement} */) => {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', () => {
           const spec = btn.getAttribute('data-jog') || '';
           const axis = spec.charAt(0);
           const direction = spec.charAt(1) === '-' ? '-' : '+';
-          const step =
-            jogStepInput && jogStepInput.value
-              ? Number(jogStepInput.value)
-              : 1.0;
-
-          try {
-            const res = await window.electronAPI.sendJog({
-              axis,
-              direction,
-              step,
-            });
-            if (!res || res.success === false) {
-              appendTerminalLine(
-                `[ERR] Jog failed: ${
-                  (res && res.error) || 'unknown error'
-                }`,
-                'error',
-              );
-              return;
-            }
-            appendTerminalLine(
-              `[OUT] JOG ${axis}${direction}${step.toFixed(3)} mm`,
-              'sent',
-            );
-          } catch (err) {
-            appendTerminalLine(
-              `[ERR] Jog failed: ${err.message || String(err)}`,
-              'error',
-            );
-          }
+          // Use the shared jog helper so buttons and keyboard behave identically
+          void performJog(axis, direction);
         });
       });
+
+    // Keyboard jog controls: map arrow keys and PageUp/PageDown to jog moves
+    // so that keyboard input behaves exactly like clicking the JOG buttons.
+    window.addEventListener('keydown', (event) => {
+      // Don't steal keys when the user is typing in an input/textarea/editor
+      const active = document.activeElement;
+      if (
+        active &&
+        (active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          active.isContentEditable)
+      ) {
+        return;
+      }
+
+      // Ignore if another handler already consumed this, or if modifiers are held
+      if (
+        event.defaultPrevented ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.metaKey
+      ) {
+        return;
+      }
+
+      /** @type {{axis: string; direction: '+' | '-'} | null} */
+      let jog = null;
+
+      switch (event.key) {
+        case 'ArrowUp':
+          jog = { axis: 'Y', direction: '+' }; // Y+
+          break;
+        case 'ArrowDown':
+          jog = { axis: 'Y', direction: '-' }; // Y-
+          break;
+        case 'ArrowRight':
+          jog = { axis: 'X', direction: '+' }; // X+
+          break;
+        case 'ArrowLeft':
+          jog = { axis: 'X', direction: '-' }; // X-
+          break;
+        case 'PageUp':
+          jog = { axis: 'Z', direction: '+' }; // Z+
+          break;
+        case 'PageDown':
+          jog = { axis: 'Z', direction: '-' }; // Z-
+          break;
+        default:
+          break;
+      }
+
+      if (!jog) return;
+
+      // Prevent default browser scrolling for these navigation keys
+      event.preventDefault();
+
+      // Use the same jog path as the on-screen buttons
+      void performJog(jog.axis, jog.direction);
+    });
+
+    // Home / zero buttons (UI-only zeroing)
+    const homeXBtn = $('home-x-btn');
+    const homeYBtn = $('home-y-btn');
+    const homeZBtn = $('home-z-btn');
+    const xy0Btn = $('jog-xy0-btn');
+    const z0Btn = $('jog-z0-btn');
+
+    if (homeXBtn) {
+      homeXBtn.addEventListener('click', () => setAxisHome('x'));
+    }
+    if (homeYBtn) {
+      homeYBtn.addEventListener('click', () => setAxisHome('y'));
+    }
+    if (homeZBtn) {
+      homeZBtn.addEventListener('click', () => setAxisHome('z'));
+    }
+    if (xy0Btn) {
+      xy0Btn.addEventListener('click', () => setAxisHome('xy'));
+    }
+    if (z0Btn) {
+      z0Btn.addEventListener('click', () => setAxisHome('z'));
+    }
   }
 
   // --- IPC event listeners from main process -------------------------------

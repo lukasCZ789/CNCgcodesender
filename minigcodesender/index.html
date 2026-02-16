@@ -251,13 +251,29 @@
 
       .jog-grid {
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        grid-auto-rows: minmax(34px, auto);
         gap: 6px;
         margin-top: 6px;
       }
 
       .jog-grid button {
         min-height: 34px;
+      }
+
+      .jog-spacer {
+        visibility: hidden;
+        pointer-events: none;
+      }
+
+      .jog-home-row {
+        margin-top: 8px;
+        display: flex;
+        gap: 6px;
+      }
+
+      .jog-home-row button {
+        flex: 1;
       }
 
       .jog-step-row {
@@ -495,12 +511,25 @@
             />
           </div>
           <div class="jog-grid">
+            <button class="jog-spacer" disabled aria-hidden="true"></button>
             <button data-jog="Y+">Y+</button>
+            <button class="jog-spacer" disabled aria-hidden="true"></button>
             <button data-jog="Z+">Z+</button>
-            <button data-jog="X+">X+</button>
+
             <button data-jog="X-">X-</button>
-            <button data-jog="Z-">Z-</button>
+            <button id="jog-xy0-btn">XY0</button>
+            <button data-jog="X+">X+</button>
+            <button id="jog-z0-btn">Z0</button>
+
+            <button class="jog-spacer" disabled aria-hidden="true"></button>
             <button data-jog="Y-">Y-</button>
+            <button class="jog-spacer" disabled aria-hidden="true"></button>
+            <button data-jog="Z-">Z-</button>
+          </div>
+          <div class="jog-home-row">
+            <button id="home-x-btn">X0</button>
+            <button id="home-y-btn">Y0</button>
+            <button id="home-z-btn">Z0</button>
           </div>
           <div class="position-display" id="position-display">
             <span><strong>X</strong>: <span id="pos-x">0.000</span></span>
