@@ -12,13 +12,16 @@ contextBridge.exposeInMainWorld('electronAPI', {
   disconnectSerial: () => ipcRenderer.invoke('serial:disconnect'),
 
   // G-code queue control
-  sendGcodeQueue: (lines) => ipcRenderer.invoke('gcode:queue', lines),
+  sendGcodeQueue: (payload) => ipcRenderer.invoke('gcode:queue', payload),
   pauseGcode: () => ipcRenderer.invoke('gcode:pause'),
   resumeGcode: () => ipcRenderer.invoke('gcode:resume'),
   stopGcode: () => ipcRenderer.invoke('gcode:stop'),
 
   // Jogging
   sendJog: (payload) => ipcRenderer.invoke('gcode:jog', payload),
+
+  // Camera pop-out window
+  openCameraWindow: (payload) => ipcRenderer.invoke('camera:open', payload),
 
   // Event subscriptions
   onSerialStatus: (callback) => {

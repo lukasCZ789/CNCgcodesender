@@ -1,13 +1,16 @@
 // main.js - Electron main process
 // Handles window creation, IPC, serial connection, and G-code queue sending
 
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { SerialPort } = require('serialport');
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
+
+/** @type {BrowserWindow | null} */
+let cameraWindow = null;
 
 /** @type {SerialPort | null} */
 let serialPort = null;
@@ -20,6 +23,10 @@ let isPaused = false;
 
 // Buffer for assembling complete serial lines
 let serialLineBuffer = '';
+
+// Last reported position (from GRBL status streaming)
+/** @type {{ x: number, y: number, z: number, source: 'MPos' | 'WPos' } | null} */
+let lastReportedPosition = null;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -37,6 +44,57 @@ function createWindow() {
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
+}
+
+function openCameraWindow({ deviceId, zoom }) {
+  const displays = screen.getAllDisplays();
+  const targetDisplay = displays.length > 1 ? displays[1] : screen.getPrimaryDisplay();
+  const bounds = targetDisplay.bounds;
+
+  const safeZoom = Number.isFinite(Number(zoom)) ? Math.max(1, Math.min(6, Number(zoom))) : 1;
+  const qs = new URLSearchParams({
+    deviceId: deviceId ? String(deviceId) : '',
+    zoom: safeZoom.toFixed(3),
+  }).toString();
+
+  if (cameraWindow && !cameraWindow.isDestroyed()) {
+    try {
+      cameraWindow.setBounds(bounds);
+      cameraWindow.show();
+      cameraWindow.focus();
+      cameraWindow.loadFile(path.join(__dirname, 'camera.html'), { search: `?${qs}` });
+      cameraWindow.setFullScreen(false);
+      cameraWindow.maximize();
+      return;
+    } catch {
+      // fall through to recreate
+    }
+  }
+
+  cameraWindow = new BrowserWindow({
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    backgroundColor: '#000000',
+    autoHideMenuBar: true,
+    resizable: true,
+    minimizable: true,
+    maximizable: true,
+    fullscreenable: true,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  cameraWindow.on('closed', () => {
+    cameraWindow = null;
+  });
+
+  cameraWindow.loadFile(path.join(__dirname, 'camera.html'), { search: `?${qs}` });
+  cameraWindow.setFullScreen(false);
+  cameraWindow.maximize();
 }
 
 // Helper to safely send events to renderer
@@ -111,8 +169,9 @@ function sendNextQueuedLine() {
 // Parse GRBL status line for machine position, e.g.:
 // <Idle|MPos:0.000,0.000,0.000|FS:0,0>
 function parseAndSendMachinePosition(line) {
-  const m = line.match(/MPos:([-\d.]+),([-\d.]+),([-\d.]+)/i) ||
-            line.match(/WPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
+  const mpos = line.match(/MPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
+  const wpos = mpos ? null : line.match(/WPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
+  const m = mpos || wpos;
   if (!m) return;
 
   const x = Number(m[1]);
@@ -120,6 +179,7 @@ function parseAndSendMachinePosition(line) {
   const z = Number(m[3]);
 
   if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+    lastReportedPosition = { x, y, z, source: mpos ? 'MPos' : 'WPos' };
     sendToRenderer('machine:position', { x, y, z });
   }
 }
@@ -251,23 +311,72 @@ ipcMain.handle('serial:disconnect', async () => {
   return { success: true };
 });
 
+// IPC: open camera pop-out window on second display (if available)
+ipcMain.handle('camera:open', async (_event, payload) => {
+  const deviceId = payload && typeof payload === 'object' ? payload.deviceId : '';
+  const zoom = payload && typeof payload === 'object' ? payload.zoom : 1;
+  try {
+    openCameraWindow({ deviceId, zoom });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
 // IPC: queue G-code lines and start sending
-ipcMain.handle('gcode:queue', async (_event, lines) => {
+ipcMain.handle('gcode:queue', async (_event, payload) => {
   if (!serialPort || !serialPort.isOpen) {
     return { success: false, error: 'Serial port is not connected.' };
+  }
+
+  /** @type {string[]} */
+  let lines = [];
+  /** @type {number} */
+  let zLiftMm = 10;
+
+  // Backwards compatible payload:
+  // - old: lines[]
+  // - new: { lines: string[], zLiftMm?: number }
+  if (Array.isArray(payload)) {
+    lines = payload;
+  } else if (payload && typeof payload === 'object') {
+    if (Array.isArray(payload.lines)) {
+      lines = payload.lines;
+    }
+    const maybeLift = Number(payload.zLiftMm);
+    if (Number.isFinite(maybeLift) && maybeLift >= 0) {
+      zLiftMm = maybeLift;
+    }
   }
 
   if (!Array.isArray(lines) || !lines.length) {
     return { success: false, error: 'No G-code lines provided.' };
   }
 
-  gcodeQueue = lines;
+  const isNearZero = (n) => Math.abs(Number(n) || 0) <= 0.0005;
+  const shouldLiftZBeforeStart =
+    !!lastReportedPosition &&
+    isNearZero(lastReportedPosition.x) &&
+    isNearZero(lastReportedPosition.y) &&
+    isNearZero(lastReportedPosition.z) &&
+    zLiftMm > 0;
+
+  const preamble = shouldLiftZBeforeStart
+    ? [
+        'G91',     // relative mode
+        `G0 Z${zLiftMm.toFixed(3)}`, // lift Z by configured amount
+        'G90',     // back to absolute
+      ]
+    : [];
+
+  gcodeQueue = preamble.concat(lines);
   currentLineIndex = 0;
   isSendingQueue = true;
   isPaused = false;
 
   sendToRenderer('gcode:queueStarted', {
     total: gcodeQueue.length,
+    zLiftPreambleApplied: shouldLiftZBeforeStart,
   });
 
   // Kick off the first line; subsequent ones are driven by GRBL responses

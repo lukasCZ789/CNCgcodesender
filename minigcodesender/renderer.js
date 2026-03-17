@@ -26,8 +26,253 @@
   let currentFileName = null;
   let currentGcodeLines = [];
 
+  const SETTINGS = {
+    zLiftMmKey: 'settings.zLiftMm',
+    defaultZLiftMm: 10,
+    cameraDeviceIdKey: 'settings.camera.deviceId',
+    cameraZoomKey: 'settings.camera.zoom',
+    defaultCameraZoom: 1,
+  };
+
   function $(id) {
     return document.getElementById(id);
+  }
+
+  function readZLiftMmFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('zlift-input'));
+    const raw = input && input.value !== undefined ? String(input.value) : '';
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return SETTINGS.defaultZLiftMm;
+    return n;
+  }
+
+  function setZLiftMmUi(value) {
+    const input = /** @type {HTMLInputElement | null} */ ($('zlift-input'));
+    if (!input) return;
+    const n = Number(value);
+    input.value = Number.isFinite(n) && n >= 0 ? String(n) : String(SETTINGS.defaultZLiftMm);
+  }
+
+  function loadSettingsIntoUi() {
+    try {
+      const raw = localStorage.getItem(SETTINGS.zLiftMmKey);
+      if (raw == null || raw === '') {
+        setZLiftMmUi(SETTINGS.defaultZLiftMm);
+        return;
+      }
+      const n = Number(raw);
+      setZLiftMmUi(Number.isFinite(n) && n >= 0 ? n : SETTINGS.defaultZLiftMm);
+    } catch {
+      setZLiftMmUi(SETTINGS.defaultZLiftMm);
+    }
+  }
+
+  function persistZLiftMmFromUi() {
+    const n = readZLiftMmFromUi();
+    try {
+      localStorage.setItem(SETTINGS.zLiftMmKey, String(n));
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  // --- Camera preview ------------------------------------------------------
+
+  /** @type {MediaStream | null} */
+  let cameraStream = null;
+
+  function getCameraElements() {
+    return {
+      select: /** @type {HTMLSelectElement | null} */ ($('camera-select')),
+      video: /** @type {HTMLVideoElement | null} */ ($('camera-video')),
+      zoomInput: /** @type {HTMLInputElement | null} */ ($('camera-zoom-input')),
+      popoutBtn: $('camera-popout-btn'),
+      hint: $('camera-hint'),
+    };
+  }
+
+  function setCameraHint(text) {
+    const { hint } = getCameraElements();
+    if (hint) hint.textContent = text;
+  }
+
+  function stopCameraStream() {
+    if (!cameraStream) return;
+    try {
+      for (const track of cameraStream.getTracks()) {
+        track.stop();
+      }
+    } catch {
+      // ignore
+    }
+    cameraStream = null;
+  }
+
+  function readCameraZoomFromUi() {
+    const { zoomInput } = getCameraElements();
+    const raw = zoomInput && zoomInput.value !== undefined ? String(zoomInput.value) : '';
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 1) return SETTINGS.defaultCameraZoom;
+    return Math.min(6, n);
+  }
+
+  function applyCameraZoom() {
+    const { video } = getCameraElements();
+    if (!video) return;
+    const zoom = readCameraZoomFromUi();
+    video.style.transform = `scale(${zoom})`;
+    try {
+      localStorage.setItem(SETTINGS.cameraZoomKey, String(zoom));
+    } catch {
+      // ignore
+    }
+  }
+
+  async function ensureCameraPermission() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraHint('Camera API není dostupné v tomto prostředí.');
+      return false;
+    }
+    // Trigger permission prompt once so labels appear in enumerateDevices().
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      for (const t of tmp.getTracks()) t.stop();
+      return true;
+    } catch (err) {
+      setCameraHint(`Nepodařilo se získat přístup ke kameře: ${err.message || String(err)}`);
+      return false;
+    }
+  }
+
+  async function refreshCameraDeviceList() {
+    const { select } = getCameraElements();
+    if (!select) return;
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const cams = devices.filter((d) => d.kind === 'videoinput');
+
+    const prev = select.value;
+    select.innerHTML = '';
+
+    if (!cams.length) {
+      const opt = document.createElement('option');
+      opt.value = '';
+      opt.textContent = 'No camera devices found';
+      select.appendChild(opt);
+      select.disabled = true;
+      return;
+    }
+
+    select.disabled = false;
+    for (const cam of cams) {
+      const opt = document.createElement('option');
+      opt.value = cam.deviceId;
+      opt.textContent = cam.label || `Camera (${cam.deviceId.slice(0, 6)}...)`;
+      select.appendChild(opt);
+    }
+
+    // Restore selection from storage if possible
+    let wanted = '';
+    try {
+      wanted = localStorage.getItem(SETTINGS.cameraDeviceIdKey) || '';
+    } catch {
+      wanted = '';
+    }
+
+    const hasWanted = wanted && cams.some((c) => c.deviceId === wanted);
+    if (hasWanted) {
+      select.value = wanted;
+    } else if (prev && cams.some((c) => c.deviceId === prev)) {
+      select.value = prev;
+    } else {
+      select.selectedIndex = 0;
+    }
+  }
+
+  async function startCameraPreview(deviceId) {
+    const { video } = getCameraElements();
+    if (!video) return;
+
+    stopCameraStream();
+    setCameraHint('Spouštím kameru...');
+
+    const constraints = deviceId
+      ? { video: { deviceId: { exact: deviceId } }, audio: false }
+      : { video: true, audio: false };
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      cameraStream = stream;
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      applyCameraZoom();
+      setCameraHint('Kamera běží.');
+    } catch (err) {
+      setCameraHint(`Kameru nelze spustit: ${err.message || String(err)}`);
+    }
+  }
+
+  async function initCameraUi() {
+    const { select, zoomInput, popoutBtn } = getCameraElements();
+    if (!select || !zoomInput) return;
+
+    // Load saved zoom
+    try {
+      const raw = localStorage.getItem(SETTINGS.cameraZoomKey);
+      const n = Number(raw);
+      zoomInput.value =
+        Number.isFinite(n) && n >= 1 ? String(Math.min(6, n)) : String(SETTINGS.defaultCameraZoom);
+    } catch {
+      zoomInput.value = String(SETTINGS.defaultCameraZoom);
+    }
+    applyCameraZoom();
+
+    zoomInput.addEventListener('input', applyCameraZoom);
+    zoomInput.addEventListener('change', applyCameraZoom);
+
+    const ok = await ensureCameraPermission();
+    if (!ok) return;
+
+    await refreshCameraDeviceList();
+
+    select.addEventListener('change', async () => {
+      const id = select.value || '';
+      try {
+        localStorage.setItem(SETTINGS.cameraDeviceIdKey, id);
+      } catch {
+        // ignore
+      }
+      await startCameraPreview(id);
+    });
+
+    // Auto-start with saved / first device
+    const id = select.value || '';
+    await startCameraPreview(id);
+
+    if (popoutBtn && window.electronAPI && window.electronAPI.openCameraWindow) {
+      popoutBtn.addEventListener('click', async () => {
+        const deviceId = select.value || '';
+        const zoom = readCameraZoomFromUi();
+        try {
+          await window.electronAPI.openCameraWindow({ deviceId, zoom });
+        } catch (err) {
+          setCameraHint(`Nepodařilo se otevřít fullscreen okno: ${err.message || String(err)}`);
+        }
+      });
+    }
+
+    // Keep list updated if devices change
+    if (navigator.mediaDevices && 'ondevicechange' in navigator.mediaDevices) {
+      navigator.mediaDevices.ondevicechange = async () => {
+        const current = select.value;
+        await refreshCameraDeviceList();
+        const next = select.value || '';
+        if (next !== current) {
+          await startCameraPreview(next);
+        }
+      };
+    }
   }
 
   function appendTerminalLine(text, type) {
@@ -449,6 +694,14 @@
     const stopBtn = $('stop-btn');
     const connectBtn = $('connect-btn');
     const disconnectBtn = $('disconnect-btn');
+    const zliftInput = /** @type {HTMLInputElement | null} */ ($('zlift-input'));
+
+    // Load persisted settings
+    loadSettingsIntoUi();
+    if (zliftInput) {
+      zliftInput.addEventListener('change', persistZLiftMmFromUi);
+      zliftInput.addEventListener('blur', persistZLiftMmFromUi);
+    }
 
     if (openFileBtn) {
       openFileBtn.addEventListener('click', async () => {
@@ -494,9 +747,12 @@
           } else if (queueState === 'idle') {
             // Start from beginning
             sentCount = 0;
-            const res = await window.electronAPI.sendGcodeQueue(
-              currentGcodeLines,
-            );
+            const zLiftMm = readZLiftMmFromUi();
+            persistZLiftMmFromUi();
+            const res = await window.electronAPI.sendGcodeQueue({
+              lines: currentGcodeLines,
+              zLiftMm,
+            });
             if (!res || res.success === false) {
               appendTerminalLine(
                 `[ERR] Queue start failed: ${
@@ -757,6 +1013,7 @@
     setQueueState('idle');
     resizeCanvas();
     drawToolpath();
+    void initCameraUi();
     appendTerminalLine(
       '[SYS] Ready. Connect to a GRBL device and open a G-code file.',
       'system',

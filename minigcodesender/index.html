@@ -72,6 +72,8 @@
         display: flex;
         flex-direction: column;
         gap: 10px;
+        overflow-y: auto;
+        overscroll-behavior: contain;
       }
 
       .panel {
@@ -118,7 +120,8 @@
       }
 
       input[type='text'],
-      input[type='number'] {
+      input[type='number'],
+      select {
         flex: 1;
         border-radius: 6px;
         border: 1px solid var(--border-subtle);
@@ -130,7 +133,8 @@
       }
 
       input[type='text']:focus,
-      input[type='number']:focus {
+      input[type='number']:focus,
+      select:focus {
         border-color: var(--accent);
         box-shadow: 0 0 0 1px var(--accent-soft);
       }
@@ -180,6 +184,15 @@
 
       button.danger:not(:disabled):hover {
         background: radial-gradient(circle at top left, #822727, #c53030);
+      }
+
+      .icon-btn {
+        width: 26px;
+        height: 26px;
+        padding: 0;
+        border-radius: 8px;
+        font-size: 14px;
+        line-height: 1;
       }
 
       .connection-status {
@@ -435,6 +448,28 @@
       .queue-status span.state-idle {
         color: var(--muted);
       }
+
+      .camera-preview {
+        margin-top: 6px;
+        border-radius: 10px;
+        border: 1px solid var(--border-subtle);
+        background: rgba(2, 6, 23, 0.6);
+        overflow: hidden;
+        position: relative;
+      }
+
+      .camera-preview video {
+        width: 100%;
+        display: block;
+        transform-origin: center center;
+        background: #000;
+      }
+
+      .hint {
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--muted);
+      }
     </style>
   </head>
   <body>
@@ -484,6 +519,16 @@
           <div class="file-row">
             <button id="open-file-btn">Open G-code...</button>
             <div id="file-name" class="file-name">No file loaded</div>
+          </div>
+          <label for="zlift-input">Z lift před startem (mm)</label>
+          <div class="field-row">
+            <input
+              id="zlift-input"
+              type="number"
+              min="0"
+              step="0.1"
+              value="10"
+            />
           </div>
           <div class="controls-row">
             <button id="start-btn" class="primary" disabled>Start</button>
@@ -535,6 +580,44 @@
             <span><strong>X</strong>: <span id="pos-x">0.000</span></span>
             <span><strong>Y</strong>: <span id="pos-y">0.000</span></span>
             <span><strong>Z</strong>: <span id="pos-z">0.000</span></span>
+          </div>
+        </section>
+
+        <section class="panel" id="camera-panel">
+          <div class="panel-header">
+            <div class="panel-title">Camera</div>
+            <div style="display:flex;align-items:center;gap:6px;">
+              <button
+                id="camera-popout-btn"
+                class="icon-btn"
+                title="Open camera fullscreen (second screen)"
+                aria-label="Open camera fullscreen"
+              >
+                ⤢
+              </button>
+              <div class="badge">Preview</div>
+            </div>
+          </div>
+          <label for="camera-select">Device</label>
+          <div class="field-row">
+            <select id="camera-select"></select>
+          </div>
+          <div class="jog-step-row">
+            <span>Zoom</span>
+            <input
+              id="camera-zoom-input"
+              type="number"
+              min="1"
+              max="6"
+              step="0.1"
+              value="1"
+            />
+          </div>
+          <div class="camera-preview">
+            <video id="camera-video" autoplay playsinline muted></video>
+          </div>
+          <div class="hint" id="camera-hint">
+            Tip: Pokud nevidíš zařízení, povol přístup ke kameře a zkus vybrat device znovu.
           </div>
         </section>
       </aside>
