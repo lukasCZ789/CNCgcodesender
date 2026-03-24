@@ -29,10 +29,32 @@
   const SETTINGS = {
     zLiftMmKey: 'settings.zLiftMm',
     defaultZLiftMm: 10,
+    toolDiameterMmKey: 'settings.toolDiameterMm',
+    defaultToolDiameterMm: 3.0,
     cameraDeviceIdKey: 'settings.camera.deviceId',
     cameraZoomKey: 'settings.camera.zoom',
     defaultCameraZoom: 1,
   };
+
+  const SIM_SPEED_MM_PER_SEC = 120;
+  /** @type {number | null} */
+  let simulationRaf = null;
+  /** @type {{running:boolean, segmentIndex:number, segmentT:number, lastTs:number, completedLength:number, currentPoint:{x:number,y:number,z:number} | null}} */
+  let simulationState = {
+    running: false,
+    segmentIndex: 0,
+    segmentT: 0,
+    lastTs: 0,
+    completedLength: 0,
+    currentPoint: null,
+  };
+
+  // Interactive 3D view rotation (drag on canvas)
+  let viewYaw = -Math.PI / 4;   // around Z axis
+  let viewPitch = 0.65;         // around X axis
+  let isDraggingView = false;
+  let lastDragX = 0;
+  let lastDragY = 0;
 
   function $(id) {
     return document.getElementById(id);
@@ -73,6 +95,38 @@
       localStorage.setItem(SETTINGS.zLiftMmKey, String(n));
     } catch {
       // ignore storage errors
+    }
+  }
+
+  function readToolDiameterFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('tool-diameter-input'));
+    const raw = input && input.value !== undefined ? String(input.value) : '';
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return SETTINGS.defaultToolDiameterMm;
+    return n;
+  }
+
+  function loadToolDiameterIntoUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('tool-diameter-input'));
+    if (!input) return;
+    try {
+      const raw = localStorage.getItem(SETTINGS.toolDiameterMmKey);
+      const n = Number(raw);
+      input.value =
+        Number.isFinite(n) && n > 0
+          ? String(n)
+          : String(SETTINGS.defaultToolDiameterMm);
+    } catch {
+      input.value = String(SETTINGS.defaultToolDiameterMm);
+    }
+  }
+
+  function persistToolDiameterFromUi() {
+    const n = readToolDiameterFromUi();
+    try {
+      localStorage.setItem(SETTINGS.toolDiameterMmKey, String(n));
+    } catch {
+      // ignore
     }
   }
 
@@ -480,9 +534,9 @@
     ctxLocal.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  // Simple isometric projection of (x,y,z) into 2D canvas
+  // Rotatable 3D-to-2D projection (yaw + pitch)
   function createProjector(bounds) {
-    if (!bounds) return () => ({ x: 0, y: 0 });
+    if (!bounds) return { project: () => ({ x: 0, y: 0 }), scale: 1 };
     const { minX, minY, minZ, maxX, maxY, maxZ } = bounds;
 
     const spanX = maxX - minX || 1;
@@ -495,7 +549,7 @@
 
     const ctxLocal = ensureCanvasContext();
     if (!canvas || !ctxLocal) {
-      return () => ({ x: 0, y: 0 });
+      return { project: () => ({ x: 0, y: 0 }), scale: 1 };
     }
 
     const width = canvas.clientWidth || canvas.width;
@@ -511,22 +565,36 @@
     const centerScreenX = width / 2;
     const centerScreenY = height / 2;
 
-    const angle = Math.PI / 6; // 30°
-    const cosA = Math.cos(angle);
-    const sinA = Math.sin(angle);
+    const cosYaw = Math.cos(viewYaw);
+    const sinYaw = Math.sin(viewYaw);
+    const cosPitch = Math.cos(viewPitch);
+    const sinPitch = Math.sin(viewPitch);
 
-    return (point) => {
+    function rotatePoint(dx, dy, dz) {
+      // Yaw around Z axis
+      const x1 = dx * cosYaw - dy * sinYaw;
+      const y1 = dx * sinYaw + dy * cosYaw;
+      const z1 = dz;
+
+      // Pitch around X axis
+      const x2 = x1;
+      const y2 = y1 * cosPitch - z1 * sinPitch;
+      const z2 = y1 * sinPitch + z1 * cosPitch;
+      return { x: x2, y: y2, z: z2 };
+    }
+
+    const project = (point) => {
       const dx = point.x - centerX;
       const dy = point.y - centerY;
       const dz = point.z - centerZ;
 
-      const isoX = (dx - dy) * cosA;
-      const isoY = (dx + dy) * sinA - dz;
+      const rotated = rotatePoint(dx, dy, dz);
 
-      const sx = centerScreenX + isoX * scale;
-      const sy = centerScreenY - isoY * scale;
+      const sx = centerScreenX + rotated.x * scale;
+      const sy = centerScreenY + rotated.y * scale;
       return { x: sx, y: sy };
     };
+    return { project, scale, rotatePoint };
   }
 
   function clearCanvas() {
@@ -553,13 +621,14 @@
 
     drawGrid(ctxLocal);
 
-    const project = createProjector(toolpathBounds);
+    const { project, scale, rotatePoint } = createProjector(toolpathBounds);
 
     ctxLocal.lineWidth = 1;
     ctxLocal.lineCap = 'round';
     ctxLocal.lineJoin = 'round';
 
-    for (const seg of toolpathSegments) {
+    for (let i = 0; i < toolpathSegments.length; i += 1) {
+      const seg = toolpathSegments[i];
       const from = project(seg.from);
       const to = project(seg.to);
 
@@ -575,7 +644,197 @@
               .getPropertyValue('--linear')
               .trim() || '#48bb78';
       ctxLocal.stroke();
+
+      // During simulation, overlay completed "cut" path (linear moves) in bright color.
+      if (simulationState.running || simulationState.currentPoint) {
+        const isCompleted = i < simulationState.segmentIndex;
+        const isCurrent = i === simulationState.segmentIndex;
+        if (seg.type === 'linear' && (isCompleted || isCurrent)) {
+          const cutTo = isCurrent
+            ? {
+                x: from.x + (to.x - from.x) * simulationState.segmentT,
+                y: from.y + (to.y - from.y) * simulationState.segmentT,
+              }
+            : to;
+          ctxLocal.beginPath();
+          ctxLocal.moveTo(from.x, from.y);
+          ctxLocal.lineTo(cutTo.x, cutTo.y);
+          ctxLocal.strokeStyle = '#f6e05e';
+          ctxLocal.lineWidth = 2;
+          ctxLocal.stroke();
+          ctxLocal.lineWidth = 1;
+        }
+      }
     }
+
+    // Draw cutter as a tall red cylinder.
+    if (simulationState.currentPoint) {
+      const pBottom = project(simulationState.currentPoint);
+      const toolDiameterMm = readToolDiameterFromUi();
+      const radiusPx = Math.max(3, (toolDiameterMm * scale) / 2);
+      const cylinderHeightMm = Math.max(toolDiameterMm * 6, 30);
+      const toolTopPoint = {
+        x: simulationState.currentPoint.x,
+        y: simulationState.currentPoint.y,
+        z: simulationState.currentPoint.z + cylinderHeightMm,
+      };
+      const pTop = project(toolTopPoint);
+
+      // Compute how circular top/bottom appear after rotation.
+      const center = toolpathBounds
+        ? {
+            x: (toolpathBounds.minX + toolpathBounds.maxX) / 2,
+            y: (toolpathBounds.minY + toolpathBounds.maxY) / 2,
+            z: (toolpathBounds.minZ + toolpathBounds.maxZ) / 2,
+          }
+        : { x: 0, y: 0, z: 0 };
+      const local = rotatePoint(
+        simulationState.currentPoint.x - center.x,
+        simulationState.currentPoint.y - center.y,
+        simulationState.currentPoint.z - center.z,
+      );
+      const localRim = rotatePoint(
+        simulationState.currentPoint.x + toolDiameterMm / 2 - center.x,
+        simulationState.currentPoint.y - center.y,
+        simulationState.currentPoint.z - center.z,
+      );
+      const rimRadiusPx = Math.max(2, Math.abs(localRim.x - local.x) * scale);
+      const ellipseRy = Math.max(2, rimRadiusPx * (0.35 + 0.35 * Math.abs(Math.sin(viewPitch))));
+
+      ctxLocal.save();
+
+      // Side wall
+      ctxLocal.beginPath();
+      ctxLocal.moveTo(pBottom.x - rimRadiusPx, pBottom.y);
+      ctxLocal.lineTo(pTop.x - rimRadiusPx, pTop.y);
+      ctxLocal.lineTo(pTop.x + rimRadiusPx, pTop.y);
+      ctxLocal.lineTo(pBottom.x + rimRadiusPx, pBottom.y);
+      ctxLocal.closePath();
+      ctxLocal.fillStyle = 'rgba(220, 38, 38, 0.72)';
+      ctxLocal.fill();
+
+      // Top cap
+      ctxLocal.beginPath();
+      ctxLocal.ellipse(pTop.x, pTop.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
+      ctxLocal.fillStyle = 'rgba(239, 68, 68, 0.95)';
+      ctxLocal.fill();
+
+      // Bottom cap
+      ctxLocal.beginPath();
+      ctxLocal.ellipse(pBottom.x, pBottom.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
+      ctxLocal.fillStyle = 'rgba(185, 28, 28, 0.85)';
+      ctxLocal.fill();
+
+      ctxLocal.strokeStyle = 'rgba(254, 202, 202, 0.95)';
+      ctxLocal.lineWidth = 1.2;
+      ctxLocal.beginPath();
+      ctxLocal.ellipse(pTop.x, pTop.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
+      ctxLocal.stroke();
+      ctxLocal.restore();
+    }
+  }
+
+  function segmentLength(seg) {
+    const dx = seg.to.x - seg.from.x;
+    const dy = seg.to.y - seg.from.y;
+    const dz = seg.to.z - seg.from.z;
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  function getSegmentPoint(seg, t) {
+    return {
+      x: seg.from.x + (seg.to.x - seg.from.x) * t,
+      y: seg.from.y + (seg.to.y - seg.from.y) * t,
+      z: seg.from.z + (seg.to.z - seg.from.z) * t,
+    };
+  }
+
+  function stopSimulation() {
+    simulationState.running = false;
+    simulationState.lastTs = 0;
+    if (simulationRaf != null) {
+      cancelAnimationFrame(simulationRaf);
+      simulationRaf = null;
+    }
+  }
+
+  function resetSimulation() {
+    stopSimulation();
+    simulationState.segmentIndex = 0;
+    simulationState.segmentT = 0;
+    simulationState.completedLength = 0;
+    simulationState.currentPoint = toolpathSegments.length
+      ? { ...toolpathSegments[0].from }
+      : null;
+    drawToolpath();
+  }
+
+  function stepSimulation(ts) {
+    if (!simulationState.running) return;
+    if (!toolpathSegments.length) {
+      stopSimulation();
+      return;
+    }
+
+    if (!simulationState.lastTs) {
+      simulationState.lastTs = ts;
+    }
+    const dt = Math.max(0, (ts - simulationState.lastTs) / 1000);
+    simulationState.lastTs = ts;
+    let remaining = SIM_SPEED_MM_PER_SEC * dt;
+
+    while (remaining > 0 && simulationState.segmentIndex < toolpathSegments.length) {
+      const seg = toolpathSegments[simulationState.segmentIndex];
+      const len = Math.max(0.000001, segmentLength(seg));
+      const remainingOnSegment = len * (1 - simulationState.segmentT);
+
+      if (remaining >= remainingOnSegment) {
+        remaining -= remainingOnSegment;
+        simulationState.segmentIndex += 1;
+        simulationState.segmentT = 0;
+        simulationState.completedLength += remainingOnSegment;
+        if (simulationState.segmentIndex >= toolpathSegments.length) {
+          simulationState.currentPoint = { ...seg.to };
+          simulationState.running = false;
+          break;
+        }
+      } else {
+        const addT = remaining / len;
+        simulationState.segmentT = Math.min(1, simulationState.segmentT + addT);
+        simulationState.currentPoint = getSegmentPoint(seg, simulationState.segmentT);
+        remaining = 0;
+      }
+    }
+
+    if (simulationState.segmentIndex < toolpathSegments.length) {
+      const seg = toolpathSegments[simulationState.segmentIndex];
+      simulationState.currentPoint = getSegmentPoint(seg, simulationState.segmentT);
+    }
+
+    drawToolpath();
+
+    if (simulationState.running) {
+      simulationRaf = requestAnimationFrame(stepSimulation);
+    } else {
+      simulationRaf = null;
+      appendTerminalLine('[SYS] Cut simulation complete.', 'system');
+    }
+  }
+
+  function startSimulation() {
+    if (!toolpathSegments.length) {
+      appendTerminalLine('[ERR] No toolpath to simulate. Load a G-code file first.', 'error');
+      return;
+    }
+    persistToolDiameterFromUi();
+    resetSimulation();
+    simulationState.running = true;
+    simulationState.lastTs = 0;
+    appendTerminalLine(
+      `[SYS] Simulating cut with tool diameter ${readToolDiameterFromUi().toFixed(2)} mm.`,
+      'system',
+    );
+    simulationRaf = requestAnimationFrame(stepSimulation);
   }
 
   function drawGrid(ctxLocal) {
@@ -619,6 +878,7 @@
     sentCount = 0;
     queuedTotal = 0;
     setQueueState('idle');
+    resetSimulation();
 
     drawToolpath();
 
@@ -686,6 +946,29 @@
     );
     if (canvas) {
       window.addEventListener('resize', drawToolpath);
+
+      canvas.addEventListener('mousedown', (event) => {
+        isDraggingView = true;
+        lastDragX = event.clientX;
+        lastDragY = event.clientY;
+      });
+      window.addEventListener('mouseup', () => {
+        isDraggingView = false;
+      });
+      window.addEventListener('mousemove', (event) => {
+        if (!isDraggingView) return;
+        const dx = event.clientX - lastDragX;
+        const dy = event.clientY - lastDragY;
+        lastDragX = event.clientX;
+        lastDragY = event.clientY;
+
+        viewYaw += dx * 0.01;
+        viewPitch += dy * 0.01;
+        // Yaw keep bounded for numeric stability; pitch intentionally unbounded.
+        const tau = Math.PI * 2;
+        viewYaw = ((viewYaw % tau) + tau) % tau;
+        drawToolpath();
+      });
     }
 
     const openFileBtn = $('open-file-btn');
@@ -694,13 +977,31 @@
     const stopBtn = $('stop-btn');
     const connectBtn = $('connect-btn');
     const disconnectBtn = $('disconnect-btn');
+    const toolDiameterInput = /** @type {HTMLInputElement | null} */ ($('tool-diameter-input'));
+    const simulateBtn = $('simulate-btn');
     const zliftInput = /** @type {HTMLInputElement | null} */ ($('zlift-input'));
 
     // Load persisted settings
     loadSettingsIntoUi();
+    loadToolDiameterIntoUi();
     if (zliftInput) {
       zliftInput.addEventListener('change', persistZLiftMmFromUi);
       zliftInput.addEventListener('blur', persistZLiftMmFromUi);
+    }
+    if (toolDiameterInput) {
+      toolDiameterInput.addEventListener('change', () => {
+        persistToolDiameterFromUi();
+        drawToolpath();
+      });
+      toolDiameterInput.addEventListener('blur', () => {
+        persistToolDiameterFromUi();
+        drawToolpath();
+      });
+    }
+    if (simulateBtn) {
+      simulateBtn.addEventListener('click', () => {
+        startSimulation();
+      });
     }
 
     if (openFileBtn) {

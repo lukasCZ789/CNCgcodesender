@@ -530,6 +530,17 @@
               value="10"
             />
           </div>
+          <label for="tool-diameter-input">Tool diameter (mm)</label>
+          <div class="field-row">
+            <input
+              id="tool-diameter-input"
+              type="number"
+              min="0.1"
+              step="0.1"
+              value="3.0"
+            />
+            <button id="simulate-btn" title="Simulate how tool cuts">Simulate Cut</button>
+          </div>
           <div class="controls-row">
             <button id="start-btn" class="primary" disabled>Start</button>
             <button id="pause-btn" disabled>Pause</button>
