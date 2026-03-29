@@ -487,9 +487,9 @@
             <div class="panel-title">Connection</div>
             <div class="badge">GRBL Serial</div>
           </div>
-          <label for="port-input">COM Port (e.g. COM3)</label>
+          <label for="port-input">COM port (stačí číslo, např. 3 → COM3)</label>
           <div class="field-row">
-            <input id="port-input" type="text" placeholder="COM3" />
+            <input id="port-input" type="text" placeholder="3" inputmode="numeric" />
           </div>
           <label for="baud-input">Baud Rate</label>
           <div class="field-row">
@@ -557,13 +557,13 @@
             <div class="badge">Manual</div>
           </div>
           <div class="jog-step-row">
-            <span>Step (mm)</span>
+            <span>Krok</span>
             <input
               id="jog-step-input"
               type="number"
-              min="0.001"
-              step="0.1"
-              value="1.0"
+              min="0.000001"
+              step="any"
+              value="1"
             />
           </div>
           <div class="jog-grid">
@@ -587,7 +587,11 @@
             <button id="home-y-btn">Y0</button>
             <button id="home-z-btn">Z0</button>
           </div>
-          <div class="position-display" id="position-display">
+          <div
+            class="position-display"
+            id="position-display"
+            title="WPos = od nulového bodu (G54). Bez WPos v reportu: MPos − ruční offset."
+          >
             <span><strong>X</strong>: <span id="pos-x">0.000</span></span>
             <span><strong>Y</strong>: <span id="pos-y">0.000</span></span>
             <span><strong>Z</strong>: <span id="pos-z">0.000</span></span>

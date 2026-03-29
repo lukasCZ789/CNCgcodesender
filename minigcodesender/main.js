@@ -20,6 +20,13 @@ let gcodeQueue = [];
 let currentLineIndex = 0;
 let isSendingQueue = false;
 let isPaused = false;
+/** Lines to send before next queued line (e.g. Z-lift after resume + jog) */
+let pendingInjectLines = [];
+/** Z lift (mm) from last Start — reused on Resume */
+let lastQueueZLiftMm = 0;
+
+/** @type {ReturnType<typeof setInterval> | null} */
+let grblStatusPollTimer = null;
 
 // Buffer for assembling complete serial lines
 let serialLineBuffer = '';
@@ -110,6 +117,45 @@ function resetQueue() {
   currentLineIndex = 0;
   isSendingQueue = false;
   isPaused = false;
+  pendingInjectLines = [];
+  lastQueueZLiftMm = 0;
+}
+
+function startGrblStatusPolling() {
+  stopGrblStatusPolling();
+  grblStatusPollTimer = setInterval(() => {
+    if (!serialPort || !serialPort.isOpen) return;
+    try {
+      serialPort.write('?');
+    } catch {
+      // ignore
+    }
+  }, 200);
+}
+
+function stopGrblStatusPolling() {
+  if (grblStatusPollTimer != null) {
+    clearInterval(grblStatusPollTimer);
+    grblStatusPollTimer = null;
+  }
+}
+
+/**
+ * Vyřízne jednu zprávu z bufferu (řádek, ok/error, nebo status <...>).
+ * @returns {{ line: string | null, rest: string }}
+ */
+function pullNextGrblMessage(buf) {
+  if (!buf.length) return { line: null, rest: buf };
+  if (buf[0] === '<') {
+    const gt = buf.indexOf('>');
+    if (gt === -1) return { line: null, rest: buf };
+    const line = buf.slice(0, gt + 1);
+    let rest = buf.slice(gt + 1).replace(/^[\r\n]+/, '');
+    return { line, rest };
+  }
+  const m = buf.match(/^([\s\S]*?)(\r\n|\n|\r)/);
+  if (!m) return { line: null, rest: buf };
+  return { line: m[1], rest: buf.slice(m[0].length) };
 }
 
 // Send next line from the G-code queue when GRBL is ready
@@ -124,6 +170,38 @@ function sendNextQueuedLine() {
       error: 'Serial port is not open. Stopping queue.',
     });
     resetQueue();
+    return;
+  }
+
+  const writeQueuedLine = (line, advanceIndexAfterSend) => {
+    serialPort.write(line + '\n', (err) => {
+      if (err) {
+        sendToRenderer('serial:status', {
+          connected: !!(serialPort && serialPort.isOpen),
+          error: `Error writing to serial: ${err.message}`,
+        });
+        resetQueue();
+        return;
+      }
+
+      sendToRenderer('gcode:sentLine', {
+        index: advanceIndexAfterSend ? currentLineIndex : -1,
+        line,
+        fromQueue: true,
+      });
+
+      if (advanceIndexAfterSend) {
+        currentLineIndex += 1;
+      }
+    });
+  };
+
+  // After Resume: Z-lift before continuing the program (safe after jog)
+  while (pendingInjectLines.length > 0) {
+    const raw = pendingInjectLines.shift();
+    let inj = String(raw || '').trim();
+    if (!inj || inj.startsWith(';') || inj.startsWith('(')) continue;
+    writeQueuedLine(inj, false);
     return;
   }
 
@@ -144,43 +222,48 @@ function sendNextQueuedLine() {
     return;
   }
 
-  // Actually write to serial
-  serialPort.write(line + '\n', (err) => {
-    if (err) {
-      sendToRenderer('serial:status', {
-        connected: !!(serialPort && serialPort.isOpen),
-        error: `Error writing to serial: ${err.message}`,
-      });
-      resetQueue();
-      return;
-    }
-
-    // Report the line we just sent
-    sendToRenderer('gcode:sentLine', {
-      index: currentLineIndex,
-      line,
-    });
-
-    // Only advance index here; next call will be triggered by GRBL "ok"/"error"
-    currentLineIndex += 1;
-  });
+  writeQueuedLine(line, true);
 }
 
 // Parse GRBL status line for machine position, e.g.:
-// <Idle|MPos:0.000,0.000,0.000|FS:0,0>
+// <Idle|MPos:1.000,2.000,0.000|WPos:0.000,0.000,0.000|FS:0,0>
+// Prefer WPos for UI and for "at work zero" checks (lift preamble), when present.
 function parseAndSendMachinePosition(line) {
-  const mpos = line.match(/MPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
-  const wpos = mpos ? null : line.match(/WPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
-  const m = mpos || wpos;
-  if (!m) return;
+  const mposM = line.match(/MPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
+  const wposM = line.match(/WPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
+  if (!mposM && !wposM) return;
 
-  const x = Number(m[1]);
-  const y = Number(m[2]);
-  const z = Number(m[3]);
+  const read = (m) => ({
+    x: Number(m[1]),
+    y: Number(m[2]),
+    z: Number(m[3]),
+  });
 
-  if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
-    lastReportedPosition = { x, y, z, source: mpos ? 'MPos' : 'WPos' };
-    sendToRenderer('machine:position', { x, y, z });
+  const mpos = mposM ? read(mposM) : null;
+  const wpos = wposM ? read(wposM) : null;
+
+  const finite = (p) =>
+    p &&
+    Number.isFinite(p.x) &&
+    Number.isFinite(p.y) &&
+    Number.isFinite(p.z);
+
+  if (finite(wpos)) {
+    lastReportedPosition = { ...wpos, source: 'WPos' };
+    sendToRenderer('machine:position', {
+      x: wpos.x,
+      y: wpos.y,
+      z: wpos.z,
+      frame: 'work',
+    });
+  } else if (finite(mpos)) {
+    lastReportedPosition = { ...mpos, source: 'MPos' };
+    sendToRenderer('machine:position', {
+      x: mpos.x,
+      y: mpos.y,
+      z: mpos.z,
+      frame: 'machine',
+    });
   }
 }
 
@@ -188,6 +271,8 @@ function attachSerialEventHandlers() {
   if (!serialPort) return;
 
   serialPort.on('open', () => {
+    serialLineBuffer = '';
+    startGrblStatusPolling();
     sendToRenderer('serial:status', {
       connected: true,
       port: serialPort.path,
@@ -203,6 +288,7 @@ function attachSerialEventHandlers() {
   });
 
   serialPort.on('close', () => {
+    stopGrblStatusPolling();
     sendToRenderer('serial:status', {
       connected: false,
       message: 'Serial port closed.',
@@ -214,21 +300,20 @@ function attachSerialEventHandlers() {
     const text = data.toString('utf8');
     serialLineBuffer += text;
 
-    let newlineIndex;
-    while ((newlineIndex = serialLineBuffer.indexOf('\n')) !== -1) {
-      const rawLine = serialLineBuffer.slice(0, newlineIndex);
-      serialLineBuffer = serialLineBuffer.slice(newlineIndex + 1);
+    while (true) {
+      const { line: raw, rest } = pullNextGrblMessage(serialLineBuffer);
+      if (!raw) {
+        serialLineBuffer = rest;
+        break;
+      }
+      serialLineBuffer = rest;
 
-      const line = rawLine.trim();
+      const line = raw.trim();
       if (!line) continue;
 
-      // Forward everything to renderer terminal
       sendToRenderer('serial:data', { line });
-
-      // Parse machine position if present
       parseAndSendMachinePosition(line);
 
-      // Advance queue on "ok" or "error"
       if (isSendingQueue && !isPaused) {
         if (/^ok\b/i.test(line) || /^error\b/i.test(line)) {
           sendNextQueuedLine();
@@ -268,6 +353,7 @@ ipcMain.handle('dialog:openFile', async () => {
 
 // IPC: connect to a GRBL device
 ipcMain.handle('serial:connect', async (_event, { path, baudRate }) => {
+  stopGrblStatusPolling();
   // Close existing port first
   if (serialPort && serialPort.isOpen) {
     try {
@@ -297,6 +383,7 @@ ipcMain.handle('serial:connect', async (_event, { path, baudRate }) => {
 
 // IPC: disconnect from GRBL
 ipcMain.handle('serial:disconnect', async () => {
+  stopGrblStatusPolling();
   if (serialPort) {
     try {
       if (serialPort.isOpen) {
@@ -354,12 +441,15 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
   }
 
   const isNearZero = (n) => Math.abs(Number(n) || 0) <= 0.0005;
-  const shouldLiftZBeforeStart =
-    !!lastReportedPosition &&
+  const hasPos = !!lastReportedPosition;
+  const atKnownZero =
+    hasPos &&
     isNearZero(lastReportedPosition.x) &&
     isNearZero(lastReportedPosition.y) &&
-    isNearZero(lastReportedPosition.z) &&
-    zLiftMm > 0;
+    isNearZero(lastReportedPosition.z);
+  // Lift: vždy když neznáme pozici (žádný ještě nenačtený <?> status), nebo jsme na 0,0,0.
+  // Když GRBL hlásí jasnou pozici mimo nulu, lift nevkládat (neškubnout Z zbytečně).
+  const shouldLiftZBeforeStart = zLiftMm > 0 && (!hasPos || atKnownZero);
 
   const zLiftCmds = shouldLiftZBeforeStart
     ? ['G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90']
@@ -372,8 +462,8 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
     const upper = s.toUpperCase();
     // Don't treat coordinate-setting commands as motion
     if (/\bG10\b/.test(upper)) return false;
-    const hasX = /(^|\s)X-?\d+(\.\d+)?/.test(upper);
-    const hasY = /(^|\s)Y-?\d+(\.\d+)?/.test(upper);
+    const hasX = /X\s*-?\d+(\.\d+)?/.test(upper);
+    const hasY = /Y\s*-?\d+(\.\d+)?/.test(upper);
     if (!hasX && !hasY) return false;
     // Motion if explicit motion code, or modal coordinate move
     const hasMotionCode = /\bG0\b|\bG00\b|\bG1\b|\bG01\b|\bG2\b|\bG02\b|\bG3\b|\bG03\b/.test(upper);
@@ -399,6 +489,8 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
   currentLineIndex = 0;
   isSendingQueue = true;
   isPaused = false;
+  pendingInjectLines = [];
+  lastQueueZLiftMm = zLiftMm;
 
   sendToRenderer('gcode:queueStarted', {
     total: gcodeQueue.length,
@@ -430,22 +522,31 @@ ipcMain.handle('gcode:resume', async () => {
   }
 
   isPaused = false;
-  // Continue from current position
+
+  const lift = Number(lastQueueZLiftMm);
+  if (Number.isFinite(lift) && lift > 0) {
+    pendingInjectLines.push('G91', `G0 Z${lift.toFixed(3)}`, 'G90');
+  }
+
   sendNextQueuedLine();
   return { success: true };
 });
 
-// IPC: stop queue and optionally send a GRBL feed hold
+// IPC: stop queue — soft reset GRBL vyčistí frontu v ovladači (pohyb se zastaví)
 ipcMain.handle('gcode:stop', async () => {
   if (serialPort && serialPort.isOpen) {
-    // GRBL feed hold (optional; safe on GRBL)
     try {
-      serialPort.write('!\n');
+      serialPort.write(Buffer.from([0x18]));
     } catch {
-      // ignore
+      try {
+        serialPort.write('!\n');
+      } catch {
+        // ignore
+      }
     }
   }
   resetQueue();
+  sendToRenderer('gcode:aborted', {});
   return { success: true };
 });
 
@@ -463,7 +564,7 @@ ipcMain.handle('gcode:sendLines', async (_event, lines) => {
       const line = String(raw || '').trim();
       if (!line) continue;
       serialPort.write(line + '\n');
-      sendToRenderer('gcode:sentLine', { line });
+      sendToRenderer('gcode:sentLine', { line, fromQueue: false });
     }
     return { success: true };
   } catch (err) {
@@ -496,7 +597,7 @@ ipcMain.handle('gcode:jog', async (_event, { axis, direction, step }) => {
   try {
     for (const cmd of cmds) {
       serialPort.write(cmd + '\n');
-      sendToRenderer('gcode:sentLine', { line: cmd });
+      sendToRenderer('gcode:sentLine', { line: cmd, fromQueue: false });
     }
   } catch (err) {
     return {

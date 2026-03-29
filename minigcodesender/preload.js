@@ -43,5 +43,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   onGcodeQueueComplete: (callback) => {
     ipcRenderer.on('gcode:queueComplete', () => callback());
   },
+  onGcodeAborted: (callback) => {
+    ipcRenderer.on('gcode:aborted', () => callback());
+  },
 });
 

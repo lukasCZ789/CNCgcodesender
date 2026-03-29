@@ -18,9 +18,11 @@
   let queuedTotal = 0;
   let sentCount = 0;
 
-  // Machine position and UI zero offsets
+  // Machine position and UI zero offsets (MPos fallback when GRBL neposílá WPos)
   let machinePos = { x: 0, y: 0, z: 0 };
   let offsetPos = { x: 0, y: 0, z: 0 };
+  /** @type {'work' | 'machine'} */
+  let positionFrame = 'machine';
 
   // Current G-code file
   let currentFileName = null;
@@ -31,6 +33,10 @@
     defaultZLiftMm: 10,
     toolDiameterMmKey: 'settings.toolDiameterMm',
     defaultToolDiameterMm: 3.0,
+    jogStepsKey: 'settings.jogSteps',
+    defaultJogSteps: 1,
+    /** mm sent to GRBL per one “krok” in the jog field */
+    JOG_MM_PER_STEP: 1,
     cameraDeviceIdKey: 'settings.camera.deviceId',
     cameraZoomKey: 'settings.camera.zoom',
     defaultCameraZoom: 1,
@@ -49,6 +55,20 @@
     currentPoint: null,
   };
 
+  /** True while sending the loaded file queue — tool follows real GRBL stream */
+  let liveCncToolSync = false;
+  /** @type {{ x: number, y: number, z: number, abs: boolean, mode: 'G0' | 'G1' | 'G2' | 'G3' | null }} */
+  let liveInterp = {
+    x: 0,
+    y: 0,
+    z: 0,
+    abs: true,
+    mode: null,
+  };
+  /** @type {{ x: number, y: number, z: number }[]} */
+  let liveCutPath = [];
+  let liveCutPathStarted = false;
+
   // Interactive 3D view rotation (drag on canvas)
   let viewYaw = -Math.PI / 4;   // around Z axis
   let viewPitch = 0.65;         // around X axis
@@ -58,6 +78,57 @@
 
   function $(id) {
     return document.getElementById(id);
+  }
+
+  /** Windows: číslo 3 → COM3; jinak nechá cestu jak je */
+  function normalizeSerialPath(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    if (/^com\d+$/i.test(s)) return s.toUpperCase();
+    if (/^\d+$/.test(s)) return `COM${s}`;
+    return s;
+  }
+
+  function readJogStepsFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('jog-step-input'));
+    const raw = input && input.value !== undefined ? String(input.value) : '';
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) return SETTINGS.defaultJogSteps;
+    return n;
+  }
+
+  function setJogStepsUi(value) {
+    const input = /** @type {HTMLInputElement | null} */ ($('jog-step-input'));
+    if (!input) return;
+    const n = Number(value);
+    const v = Number.isFinite(n) && n > 0 ? n : SETTINGS.defaultJogSteps;
+    input.value = String(v);
+  }
+
+  function loadJogStepsIntoUi() {
+    try {
+      const raw = localStorage.getItem(SETTINGS.jogStepsKey);
+      const n = Number(raw);
+      setJogStepsUi(Number.isFinite(n) && n > 0 ? n : SETTINGS.defaultJogSteps);
+    } catch {
+      setJogStepsUi(SETTINGS.defaultJogSteps);
+    }
+  }
+
+  function persistJogStepsFromUi() {
+    try {
+      localStorage.setItem(SETTINGS.jogStepsKey, String(readJogStepsFromUi()));
+    } catch {
+      // ignore
+    }
+  }
+
+  function multiplyJogSteps(factor) {
+    const v = readJogStepsFromUi();
+    const next =
+      factor >= 1 ? v * factor : Math.max(1e-9, v * factor);
+    setJogStepsUi(next);
+    persistJogStepsFromUi();
   }
 
   function readZLiftMmFromUi() {
@@ -415,17 +486,31 @@
     }
   }
 
-  function updateMachinePosition({ x, y, z }) {
+  function updateMachinePosition(pos) {
+    const x = Number(pos.x);
+    const y = Number(pos.y);
+    const z = Number(pos.z);
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+
     machinePos = { x, y, z };
+    positionFrame = pos.frame === 'work' ? 'work' : 'machine';
+
     const px = $('pos-x');
     const py = $('pos-y');
     const pz = $('pos-z');
-    const dx = x - offsetPos.x;
-    const dy = y - offsetPos.y;
-    const dz = z - offsetPos.z;
-    if (px) px.textContent = dx.toFixed(3);
-    if (py) py.textContent = dy.toFixed(3);
-    if (pz) pz.textContent = dz.toFixed(3);
+
+    if (positionFrame === 'work') {
+      if (px) px.textContent = x.toFixed(3);
+      if (py) py.textContent = y.toFixed(3);
+      if (pz) pz.textContent = z.toFixed(3);
+    } else {
+      const dx = x - offsetPos.x;
+      const dy = y - offsetPos.y;
+      const dz = z - offsetPos.z;
+      if (px) px.textContent = dx.toFixed(3);
+      if (py) py.textContent = dy.toFixed(3);
+      if (pz) pz.textContent = dz.toFixed(3);
+    }
   }
 
   function setAxisHome(axis) {
@@ -472,8 +557,6 @@
 
     const ok = await sendLines(['G90', 'G54', cmd]);
     if (ok) {
-      // Keep UI display consistent with new zero
-      setAxisHome(axis);
       appendTerminalLine(`[SYS] Set work zero (${axis.toUpperCase()})`, 'system');
     }
   }
@@ -489,6 +572,86 @@
         : 'G0 Z0';
     const ok = await sendLines(['G90', 'G54', cmd]);
     if (ok) appendTerminalLine(`[SYS] Go to ${which.toUpperCase()}0`, 'system');
+  }
+
+  function cleanRawGcodeLine(raw) {
+    let line = String(raw || '').replace(/\(.*?\)/g, '');
+    const semi = line.indexOf(';');
+    if (semi >= 0) line = line.slice(0, semi);
+    return line.trim();
+  }
+
+  function resetLiveToolForQueue() {
+    liveInterp = { x: 0, y: 0, z: 0, abs: true, mode: null };
+    liveCutPath = [];
+    liveCutPathStarted = false;
+    simulationState.currentPoint = { x: 0, y: 0, z: 0 };
+    simulationState.running = false;
+    simulationState.segmentIndex = 0;
+    simulationState.segmentT = 0;
+  }
+
+  function endLiveCncToolSync() {
+    liveCncToolSync = false;
+  }
+
+  function applyLiveToolLine(rawLine) {
+    const line = cleanRawGcodeLine(rawLine);
+    if (!line || line.startsWith('(')) return;
+
+    const upper = line.toUpperCase();
+    if (upper.startsWith('$')) return;
+    if (/\bG10\b/.test(upper)) return;
+    if (/\bG28\b/.test(upper) || /\bG30\b/.test(upper)) return;
+
+    const ax = (letter) => {
+      const m = upper.match(new RegExp(`${letter}\\s*(-?\\d+(?:\\.\\d+)?)`, 'i'));
+      return m ? Number(m[1]) : null;
+    };
+
+    if (/\bG90\b/.test(upper)) liveInterp.abs = true;
+    if (/\bG91\b/.test(upper)) liveInterp.abs = false;
+
+    if (/\bG0\b|\bG00\b/.test(upper)) liveInterp.mode = 'G0';
+    else if (/\bG1\b|\bG01\b/.test(upper)) liveInterp.mode = 'G1';
+    else if (/\bG2\b|\bG02\b/.test(upper)) liveInterp.mode = 'G2';
+    else if (/\bG3\b|\bG03\b/.test(upper)) liveInterp.mode = 'G3';
+
+    const nx = ax('X');
+    const ny = ax('Y');
+    const nz = ax('Z');
+    const hasCoord = nx != null || ny != null || nz != null;
+    if (!hasCoord || !liveInterp.mode) return;
+
+    const ox = liveInterp.x;
+    const oy = liveInterp.y;
+    const oz = liveInterp.z;
+    let x = liveInterp.x;
+    let y = liveInterp.y;
+    let z = liveInterp.z;
+
+    if (liveInterp.abs) {
+      if (nx != null) x = nx;
+      if (ny != null) y = ny;
+      if (nz != null) z = nz;
+    } else {
+      if (nx != null) x += nx;
+      if (ny != null) y += ny;
+      if (nz != null) z += nz;
+    }
+
+    liveInterp.x = x;
+    liveInterp.y = y;
+    liveInterp.z = z;
+    simulationState.currentPoint = { x, y, z };
+
+    if (liveInterp.mode === 'G1') {
+      if (!liveCutPathStarted) {
+        liveCutPath.push({ x: ox, y: oy, z: oz });
+        liveCutPathStarted = true;
+      }
+      liveCutPath.push({ x, y, z });
+    }
   }
 
   // --- G-code parsing and 3D-ish projection drawing -----------------------
@@ -796,26 +959,42 @@
               .trim() || '#48bb78';
       ctxLocal.stroke();
 
-      // During simulation, overlay completed "cut" path (linear moves) in bright color.
-      if (simulationState.running || simulationState.currentPoint) {
-        const isCompleted = i < simulationState.segmentIndex;
-        const isCurrent = i === simulationState.segmentIndex;
-        if (seg.type === 'linear' && (isCompleted || isCurrent)) {
-          const cutTo = isCurrent
-            ? {
-                x: from.x + (to.x - from.x) * simulationState.segmentT,
-                y: from.y + (to.y - from.y) * simulationState.segmentT,
-              }
-            : to;
-          ctxLocal.beginPath();
-          ctxLocal.moveTo(from.x, from.y);
-          ctxLocal.lineTo(cutTo.x, cutTo.y);
-          ctxLocal.strokeStyle = '#f6e05e';
-          ctxLocal.lineWidth = 2;
-          ctxLocal.stroke();
-          ctxLocal.lineWidth = 1;
+      // Žlutý „řez“: buď z reálného běhu (G1 body), nebo offline simulace.
+      if (!(liveCutPath.length >= 2)) {
+        if (simulationState.running || simulationState.currentPoint) {
+          const isCompleted = i < simulationState.segmentIndex;
+          const isCurrent = i === simulationState.segmentIndex;
+          if (seg.type === 'linear' && (isCompleted || isCurrent)) {
+            const cutTo = isCurrent
+              ? {
+                  x: from.x + (to.x - from.x) * simulationState.segmentT,
+                  y: from.y + (to.y - from.y) * simulationState.segmentT,
+                }
+              : to;
+            ctxLocal.beginPath();
+            ctxLocal.moveTo(from.x, from.y);
+            ctxLocal.lineTo(cutTo.x, cutTo.y);
+            ctxLocal.strokeStyle = '#f6e05e';
+            ctxLocal.lineWidth = 2;
+            ctxLocal.stroke();
+            ctxLocal.lineWidth = 1;
+          }
         }
       }
+    }
+
+    if (liveCutPath.length >= 2) {
+      ctxLocal.beginPath();
+      const p0 = project(liveCutPath[0]);
+      ctxLocal.moveTo(p0.x, p0.y);
+      for (let k = 1; k < liveCutPath.length; k++) {
+        const p = project(liveCutPath[k]);
+        ctxLocal.lineTo(p.x, p.y);
+      }
+      ctxLocal.strokeStyle = '#f6e05e';
+      ctxLocal.lineWidth = 2;
+      ctxLocal.stroke();
+      ctxLocal.lineWidth = 1;
     }
 
     // Draw cutter as a tall red cylinder.
@@ -977,6 +1156,8 @@
       appendTerminalLine('[ERR] No toolpath to simulate. Load a G-code file first.', 'error');
       return;
     }
+    liveCutPath = [];
+    liveCutPathStarted = false;
     persistToolDiameterFromUi();
     resetSimulation();
     simulationState.running = true;
@@ -1029,6 +1210,9 @@
     sentCount = 0;
     queuedTotal = 0;
     setQueueState('idle');
+    endLiveCncToolSync();
+    liveCutPath = [];
+    liveCutPathStarted = false;
     resetSimulation();
 
     drawToolpath();
@@ -1056,17 +1240,14 @@
    * Shared by both the on-screen JOG buttons and the keyboard shortcuts.
    */
   async function performJog(axis, direction) {
-    const jogStepInput = $('jog-step-input');
-    const step =
-      jogStepInput && jogStepInput.value
-        ? Number(jogStepInput.value)
-        : 1.0;
+    const steps = readJogStepsFromUi();
+    const stepMm = steps * SETTINGS.JOG_MM_PER_STEP;
 
     try {
       const res = await window.electronAPI.sendJog({
         axis,
         direction,
-        step,
+        step: stepMm,
       });
       if (!res || res.success === false) {
         appendTerminalLine(
@@ -1078,7 +1259,7 @@
         return;
       }
       appendTerminalLine(
-        `[OUT] JOG ${axis}${direction}${step.toFixed(3)} mm`,
+        `[OUT] JOG ${axis}${direction} ${steps} kroků (${stepMm.toFixed(3)} mm)`,
         'sent',
       );
     } catch (err) {
@@ -1135,6 +1316,19 @@
     // Load persisted settings
     loadSettingsIntoUi();
     loadToolDiameterIntoUi();
+    loadJogStepsIntoUi();
+
+    const jogStepInput = /** @type {HTMLInputElement | null} */ ($('jog-step-input'));
+    if (jogStepInput) {
+      jogStepInput.addEventListener('change', persistJogStepsFromUi);
+      jogStepInput.addEventListener('blur', persistJogStepsFromUi);
+      jogStepInput.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+        e.preventDefault();
+        if (e.key === 'ArrowUp') multiplyJogSteps(2);
+        else multiplyJogSteps(0.5);
+      });
+    }
     if (zliftInput) {
       zliftInput.addEventListener('change', persistZLiftMmFromUi);
       zliftInput.addEventListener('blur', persistZLiftMmFromUi);
@@ -1199,6 +1393,10 @@
           } else if (queueState === 'idle') {
             // Start from beginning
             sentCount = 0;
+            stopSimulation();
+            liveCncToolSync = true;
+            resetLiveToolForQueue();
+            drawToolpath();
             const zLiftMm = readZLiftMmFromUi();
             persistZLiftMmFromUi();
             const res = await window.electronAPI.sendGcodeQueue({
@@ -1206,6 +1404,9 @@
               zLiftMm,
             });
             if (!res || res.success === false) {
+              endLiveCncToolSync();
+              resetSimulation();
+              drawToolpath();
               appendTerminalLine(
                 `[ERR] Queue start failed: ${
                   (res && res.error) || 'unknown error'
@@ -1268,8 +1469,6 @@
             );
             return;
           }
-          setQueueState('idle');
-          appendTerminalLine('[SYS] Queue stopped.', 'system');
         } catch (err) {
           appendTerminalLine(
             `[ERR] Stop failed: ${err.message || String(err)}`,
@@ -1283,12 +1482,13 @@
       connectBtn.addEventListener('click', async () => {
         const portInput = $('port-input');
         const baudInput = $('baud-input');
-        const port = portInput ? portInput.value.trim() : '';
+        const portRaw = portInput ? portInput.value.trim() : '';
+        const port = normalizeSerialPath(portRaw);
         const baudRate = baudInput ? Number(baudInput.value) || 115200 : 115200;
 
         if (!port) {
           appendTerminalLine(
-            '[ERR] Please enter a serial COM port (e.g. COM3).',
+            '[ERR] Zadej číslo portu (např. 3) nebo celý název (COM3).',
             'error',
           );
           return;
@@ -1313,6 +1513,8 @@
       disconnectBtn.addEventListener('click', async () => {
         try {
           await window.electronAPI.disconnectSerial();
+          endLiveCncToolSync();
+          drawToolpath();
           appendTerminalLine('[SYS] Disconnected serial port.', 'system');
         } catch (err) {
           appendTerminalLine(
@@ -1443,19 +1645,44 @@
       if (!info || !info.line) return;
       appendTerminalLine(`> ${info.line}`, 'sent');
       sentCount += 1;
+      if (
+        liveCncToolSync &&
+        queueState === 'running' &&
+        info.fromQueue === true
+      ) {
+        applyLiveToolLine(info.line);
+        drawToolpath();
+      }
       setQueueState(queueState); // refresh counters
     });
 
     api.onGcodeQueueStarted((info) => {
+      stopSimulation();
       queuedTotal = (info && info.total) || currentGcodeLines.length;
-      sentCount = 0;
       setQueueState('running');
     });
 
     api.onGcodeQueueComplete(() => {
+      endLiveCncToolSync();
       setQueueState('idle');
+      drawToolpath();
       appendTerminalLine('[SYS] Queue complete.', 'system');
     });
+
+    if (api.onGcodeAborted) {
+      api.onGcodeAborted(() => {
+        setQueueState('idle');
+        endLiveCncToolSync();
+        sentCount = 0;
+        queuedTotal = 0;
+        resetSimulation();
+        drawToolpath();
+        appendTerminalLine(
+          '[SYS] Stop — běh zrušen; fronta prázdná, můžeš znovu načíst G-code nebo jogovat. GRBL soft reset (0x18). Při Alarm odemkni ($X).',
+          'system',
+        );
+      });
+    }
   }
 
   // Boot
