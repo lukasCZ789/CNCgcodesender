@@ -361,15 +361,41 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
     isNearZero(lastReportedPosition.z) &&
     zLiftMm > 0;
 
-  const preamble = shouldLiftZBeforeStart
-    ? [
-        'G91',     // relative mode
-        `G0 Z${zLiftMm.toFixed(3)}`, // lift Z by configured amount
-        'G90',     // back to absolute
-      ]
+  const zLiftCmds = shouldLiftZBeforeStart
+    ? ['G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90']
     : [];
 
-  gcodeQueue = preamble.concat(lines);
+  const isFirstXyMotionLine = (raw) => {
+    const s = String(raw || '').trim();
+    if (!s) return false;
+    if (s.startsWith(';') || s.startsWith('(')) return false;
+    const upper = s.toUpperCase();
+    // Don't treat coordinate-setting commands as motion
+    if (/\bG10\b/.test(upper)) return false;
+    const hasX = /(^|\s)X-?\d+(\.\d+)?/.test(upper);
+    const hasY = /(^|\s)Y-?\d+(\.\d+)?/.test(upper);
+    if (!hasX && !hasY) return false;
+    // Motion if explicit motion code, or modal coordinate move
+    const hasMotionCode = /\bG0\b|\bG00\b|\bG1\b|\bG01\b|\bG2\b|\bG02\b|\bG3\b|\bG03\b/.test(upper);
+    return hasMotionCode || hasX || hasY;
+  };
+
+  /** @type {string[]} */
+  const finalQueue = lines.slice();
+
+  // Insert Z-lift right BEFORE the first XY move so XY travel happens at safe Z,
+  // even if the file starts with a Z0 move.
+  if (zLiftCmds.length) {
+    const idx = finalQueue.findIndex(isFirstXyMotionLine);
+    if (idx >= 0) {
+      finalQueue.splice(idx, 0, ...zLiftCmds);
+    } else {
+      // No XY moves found; fall back to start
+      finalQueue.unshift(...zLiftCmds);
+    }
+  }
+
+  gcodeQueue = finalQueue;
   currentLineIndex = 0;
   isSendingQueue = true;
   isPaused = false;
@@ -421,6 +447,28 @@ ipcMain.handle('gcode:stop', async () => {
   }
   resetQueue();
   return { success: true };
+});
+
+// IPC: send one-off G-code lines (not queued)
+ipcMain.handle('gcode:sendLines', async (_event, lines) => {
+  if (!serialPort || !serialPort.isOpen) {
+    return { success: false, error: 'Serial port is not connected.' };
+  }
+  if (!Array.isArray(lines) || lines.length === 0) {
+    return { success: false, error: 'No lines provided.' };
+  }
+
+  try {
+    for (const raw of lines) {
+      const line = String(raw || '').trim();
+      if (!line) continue;
+      serialPort.write(line + '\n');
+      sendToRenderer('gcode:sentLine', { line });
+    }
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
 });
 
 // IPC: simple jog controls (X/Y/Z, relative)

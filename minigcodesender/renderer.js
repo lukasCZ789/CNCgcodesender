@@ -439,16 +439,72 @@
     updateMachinePosition(machinePos);
   }
 
+  async function sendLines(lines) {
+    try {
+      const res = await window.electronAPI.sendGcodeLines(lines);
+      if (!res || res.success === false) {
+        appendTerminalLine(
+          `[ERR] Command failed: ${(res && res.error) || 'unknown error'}`,
+          'error',
+        );
+        return false;
+      }
+      return true;
+    } catch (err) {
+      appendTerminalLine(
+        `[ERR] Command failed: ${err.message || String(err)}`,
+        'error',
+      );
+      return false;
+    }
+  }
+
+  async function setWorkZero(axis) {
+    // Set current position to 0 in G54 using G10 L20
+    const cmd =
+      axis === 'x'
+        ? 'G10 L20 P1 X0'
+        : axis === 'y'
+        ? 'G10 L20 P1 Y0'
+        : axis === 'z'
+        ? 'G10 L20 P1 Z0'
+        : 'G10 L20 P1 X0 Y0';
+
+    const ok = await sendLines(['G90', 'G54', cmd]);
+    if (ok) {
+      // Keep UI display consistent with new zero
+      setAxisHome(axis);
+      appendTerminalLine(`[SYS] Set work zero (${axis.toUpperCase()})`, 'system');
+    }
+  }
+
+  async function goToWorkZero(which) {
+    const cmd =
+      which === 'xy'
+        ? 'G0 X0 Y0'
+        : which === 'x'
+        ? 'G0 X0'
+        : which === 'y'
+        ? 'G0 Y0'
+        : 'G0 Z0';
+    const ok = await sendLines(['G90', 'G54', cmd]);
+    if (ok) appendTerminalLine(`[SYS] Go to ${which.toUpperCase()}0`, 'system');
+  }
+
   // --- G-code parsing and 3D-ish projection drawing -----------------------
 
   function parseGcode(lines) {
     /** @type {{from:{x:number,y:number,z:number}, to:{x:number,y:number,z:number}, type:'rapid'|'linear'}[]} */
     const segments = [];
 
+    // Visualization resolution (trade-off: detail vs perf)
+    const ARC_MAX_SEGMENTS = 180;
+    const ARC_MAX_STEP_MM = 1.0; // smaller => smoother
+
     let x = 0;
     let y = 0;
     let z = 0;
-    let mode = null; // 'G0' or 'G1'
+    let mode = null; // 'G0' | 'G1' | 'G2' | 'G3'
     let lastPoint = { x, y, z };
 
     let minX = Infinity;
@@ -458,9 +514,70 @@
     let maxY = -Infinity;
     let maxZ = -Infinity;
 
+    const updateBounds = (p) => {
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      minZ = Math.min(minZ, p.z);
+      maxX = Math.max(maxX, p.x);
+      maxY = Math.max(maxY, p.y);
+      maxZ = Math.max(maxZ, p.z);
+    };
+
+    const getNum = (upper, letter) => {
+      const m = upper.match(new RegExp(`${letter}(-?\\d+(?:\\.\\d+)?)`));
+      return m ? Number(m[1]) : null;
+    };
+
+    const addLine = (from, to, type) => {
+      segments.push({ from: { ...from }, to: { ...to }, type });
+      updateBounds(to);
+    };
+
+    const approxArcXY = (from, to, center, cw) => {
+      const sx = from.x - center.x;
+      const sy = from.y - center.y;
+      const ex = to.x - center.x;
+      const ey = to.y - center.y;
+
+      const r0 = Math.hypot(sx, sy);
+      const r1 = Math.hypot(ex, ey);
+      const r = (r0 + r1) / 2;
+      if (!Number.isFinite(r) || r <= 0) {
+        addLine(from, to, 'linear');
+        return;
+      }
+
+      let a0 = Math.atan2(sy, sx);
+      let a1 = Math.atan2(ey, ex);
+      let da = a1 - a0;
+      if (cw) {
+        if (da >= 0) da -= Math.PI * 2;
+      } else {
+        if (da <= 0) da += Math.PI * 2;
+      }
+
+      const arcLen = Math.abs(da) * r;
+      const n = Math.max(
+        6,
+        Math.min(ARC_MAX_SEGMENTS, Math.ceil(arcLen / ARC_MAX_STEP_MM)),
+      );
+
+      let prev = { ...from };
+      for (let i = 1; i <= n; i += 1) {
+        const t = i / n;
+        const a = a0 + da * t;
+        const p = {
+          x: center.x + Math.cos(a) * r,
+          y: center.y + Math.sin(a) * r,
+          z: from.z + (to.z - from.z) * t,
+        };
+        addLine(prev, p, 'linear');
+        prev = p;
+      }
+    };
+
     for (let raw of lines) {
       let line = String(raw || '');
-      // Strip inline comments in parentheses and after ';'
       line = line.replace(/\(.*?\)/g, '');
       const semi = line.indexOf(';');
       if (semi >= 0) line = line.slice(0, semi);
@@ -469,50 +586,84 @@
 
       const upper = line.toUpperCase();
 
-      if (upper.includes('G0 ') || upper.includes('G00')) {
-        mode = 'G0';
-      } else if (upper.includes('G1 ') || upper.includes('G01')) {
-        mode = 'G1';
-      }
+      // Modal motion
+      if (/\bG0\b|\bG00\b/.test(upper)) mode = 'G0';
+      else if (/\bG1\b|\bG01\b/.test(upper)) mode = 'G1';
+      else if (/\bG2\b|\bG02\b/.test(upper)) mode = 'G2';
+      else if (/\bG3\b|\bG03\b/.test(upper)) mode = 'G3';
 
       // Extract coordinates (absolute only; relative G91 not handled)
-      const xMatch = upper.match(/X(-?\d+(\.\d+)?)/);
-      const yMatch = upper.match(/Y(-?\d+(\.\d+)?)/);
-      const zMatch = upper.match(/Z(-?\d+(\.\d+)?)/);
+      const nx = getNum(upper, 'X');
+      const ny = getNum(upper, 'Y');
+      const nz = getNum(upper, 'Z');
 
-      const hasCoord = !!(xMatch || yMatch || zMatch);
+      const hasCoord = nx != null || ny != null || nz != null;
       if (!mode || !hasCoord) continue;
 
-      if (xMatch) x = parseFloat(xMatch[1]);
-      if (yMatch) y = parseFloat(yMatch[1]);
-      if (zMatch) z = parseFloat(zMatch[1]);
+      const start = { x, y, z };
+      if (nx != null) x = nx;
+      if (ny != null) y = ny;
+      if (nz != null) z = nz;
+      const end = { x, y, z };
 
-      const nextPoint = { x, y, z };
+      if (mode === 'G0') {
+        addLine(start, end, 'rapid');
+      } else if (mode === 'G1') {
+        addLine(start, end, 'linear');
+      } else if (mode === 'G2' || mode === 'G3') {
+        // Approximate arcs in XY plane (I/J or R)
+        const i = getNum(upper, 'I');
+        const j = getNum(upper, 'J');
+        const r = getNum(upper, 'R');
 
-      segments.push({
-        from: { ...lastPoint },
-        to: { ...nextPoint },
-        type: mode === 'G0' ? 'rapid' : 'linear',
-      });
+        if (i != null || j != null) {
+          const cx = start.x + (i || 0);
+          const cy = start.y + (j || 0);
+          approxArcXY(start, end, { x: cx, y: cy }, mode === 'G2');
+        } else if (r != null && Number.isFinite(r) && r !== 0) {
+          // Compute center from radius (one of two solutions)
+          const dx = end.x - start.x;
+          const dy = end.y - start.y;
+          const d = Math.hypot(dx, dy);
+          if (d > 0 && d <= 2 * Math.abs(r)) {
+            const mx = (start.x + end.x) / 2;
+            const my = (start.y + end.y) / 2;
+            const h = Math.sqrt(Math.max(0, r * r - (d / 2) * (d / 2)));
+            const ux = -dy / d;
+            const uy = dx / d;
+            const c1 = { x: mx + ux * h, y: my + uy * h };
+            const c2 = { x: mx - ux * h, y: my - uy * h };
 
-      lastPoint = nextPoint;
+            // Choose center that matches CW/CCW better
+            const pick = (c) => {
+              const a0 = Math.atan2(start.y - c.y, start.x - c.x);
+              const a1 = Math.atan2(end.y - c.y, end.x - c.x);
+              let da = a1 - a0;
+              if (mode === 'G2') {
+                if (da >= 0) da -= Math.PI * 2;
+              } else {
+                if (da <= 0) da += Math.PI * 2;
+              }
+              return da;
+            };
+            const da1 = pick(c1);
+            const da2 = pick(c2);
+            const center = Math.abs(da1) <= Math.abs(da2) ? c1 : c2;
+            approxArcXY(start, end, center, mode === 'G2');
+          } else {
+            addLine(start, end, 'linear');
+          }
+        } else {
+          addLine(start, end, 'linear');
+        }
+      }
 
-      minX = Math.min(minX, x);
-      minY = Math.min(minY, y);
-      minZ = Math.min(minZ, z);
-      maxX = Math.max(maxX, x);
-      maxY = Math.max(maxY, y);
-      maxZ = Math.max(maxZ, z);
+      lastPoint = end;
+      updateBounds(end);
     }
 
-    if (!segments.length) {
-      return { segments: [], bounds: null };
-    }
-
-    return {
-      segments,
-      bounds: { minX, minY, minZ, maxX, maxY, maxZ },
-    };
+    if (!segments.length) return { segments: [], bounds: null };
+    return { segments, bounds: { minX, minY, minZ, maxX, maxY, maxZ } };
   }
 
   function ensureCanvasContext() {
@@ -1244,7 +1395,7 @@
       void performJog(jog.axis, jog.direction);
     });
 
-    // Home / zero buttons (UI-only zeroing)
+    // Home / zero buttons
     const homeXBtn = $('home-x-btn');
     const homeYBtn = $('home-y-btn');
     const homeZBtn = $('home-z-btn');
@@ -1252,19 +1403,19 @@
     const z0Btn = $('jog-z0-btn');
 
     if (homeXBtn) {
-      homeXBtn.addEventListener('click', () => setAxisHome('x'));
+      homeXBtn.addEventListener('click', () => void setWorkZero('x'));
     }
     if (homeYBtn) {
-      homeYBtn.addEventListener('click', () => setAxisHome('y'));
+      homeYBtn.addEventListener('click', () => void setWorkZero('y'));
     }
     if (homeZBtn) {
-      homeZBtn.addEventListener('click', () => setAxisHome('z'));
+      homeZBtn.addEventListener('click', () => void setWorkZero('z'));
     }
     if (xy0Btn) {
-      xy0Btn.addEventListener('click', () => setAxisHome('xy'));
+      xy0Btn.addEventListener('click', () => void goToWorkZero('xy'));
     }
     if (z0Btn) {
-      z0Btn.addEventListener('click', () => setAxisHome('z'));
+      z0Btn.addEventListener('click', () => void goToWorkZero('z'));
     }
   }
 
