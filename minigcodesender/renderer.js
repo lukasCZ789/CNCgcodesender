@@ -630,10 +630,18 @@
     liveInterp = { x: 0, y: 0, z: 0, abs: true, mode: null };
     liveCutPath = [];
     liveCutPathStarted = false;
-    simulationState.currentPoint = { x: 0, y: 0, z: 0 };
     simulationState.running = false;
     simulationState.segmentIndex = 0;
     simulationState.segmentT = 0;
+    if (toolpathSegments.length) {
+      const p0 = toolpathSegments[0].from;
+      liveInterp.x = p0.x;
+      liveInterp.y = p0.y;
+      liveInterp.z = p0.z;
+      simulationState.currentPoint = { x: p0.x, y: p0.y, z: p0.z };
+    } else {
+      simulationState.currentPoint = { x: 0, y: 0, z: 0 };
+    }
   }
 
   function endLiveCncToolSync() {
@@ -665,7 +673,17 @@
     const nx = ax('X');
     const ny = ax('Y');
     const nz = ax('Z');
-    const hasCoord = nx != null || ny != null || nz != null;
+    const nI = ax('I');
+    const nJ = ax('J');
+    const nR = ax('R');
+
+    const isArc =
+      liveInterp.mode === 'G2' || liveInterp.mode === 'G3';
+    const hasCoord =
+      nx != null ||
+      ny != null ||
+      nz != null ||
+      (isArc && (nI != null || nJ != null || nR != null));
     if (!hasCoord || !liveInterp.mode) return;
 
     const ox = liveInterp.x;
@@ -690,7 +708,8 @@
     liveInterp.z = z;
     simulationState.currentPoint = { x, y, z };
 
-    if (liveInterp.mode === 'G1') {
+    const isCutMotion = liveInterp.mode === 'G1' || isArc;
+    if (isCutMotion) {
       if (!liveCutPathStarted) {
         liveCutPath.push({ x: ox, y: oy, z: oz });
         liveCutPathStarted = true;
@@ -999,16 +1018,16 @@
     ctxLocal.restore();
   }
 
-  /** Poloha vrtáku: offline simulace > živý stroj (WPos) > odvozeno z fronty G-kódu */
+  /** Poloha vrtáku: offline sim > při live frontě přesně podle odeslaných příkazů > jinak WPos ze stroje */
   function getToolDisplayPoint() {
     if (simulationState.running && simulationState.currentPoint) {
       return { ...simulationState.currentPoint };
     }
-    if (serialConnected) {
-      return { ...lastWorkPosition };
-    }
     if (liveCncToolSync && simulationState.currentPoint) {
       return { ...simulationState.currentPoint };
+    }
+    if (serialConnected) {
+      return { ...lastWorkPosition };
     }
     return null;
   }
@@ -1042,19 +1061,10 @@
         ? rimPx
         : Math.max(2, rimPx * (0.35 + 0.35 * Math.abs(Math.sin(viewPitch))));
 
-    const isLiveMachine = serialConnected && !simulationState.running;
-    const wall = isLiveMachine
-      ? 'rgba(56, 178, 172, 0.7)'
-      : 'rgba(220, 38, 38, 0.72)';
-    const top = isLiveMachine
-      ? 'rgba(79, 209, 197, 0.95)'
-      : 'rgba(239, 68, 68, 0.95)';
-    const bottom = isLiveMachine
-      ? 'rgba(45, 127, 120, 0.85)'
-      : 'rgba(185, 28, 28, 0.85)';
-    const strokeTop = isLiveMachine
-      ? 'rgba(204, 251, 241, 0.9)'
-      : 'rgba(254, 202, 202, 0.95)';
+    const wall = 'rgba(234, 88, 12, 0.78)';
+    const top = 'rgba(253, 186, 116, 0.96)';
+    const bottom = 'rgba(180, 83, 9, 0.9)';
+    const strokeTop = 'rgba(255, 247, 237, 0.92)';
 
     ctxLocal.save();
 
@@ -1267,6 +1277,15 @@
     simulationRaf = requestAnimationFrame(stepSimulation);
   }
 
+  /** Rovina mřížky: pod nejnižším bodem toolpathu (stůl „pod“ dílem), bez souboru z = 0 */
+  function getGridZPlane() {
+    if (!toolpathBounds) return 0;
+    const { minZ, maxZ } = toolpathBounds;
+    const span = Math.max(maxZ - minZ, 1);
+    const margin = Math.max(0.5, span * 0.04);
+    return minZ - margin;
+  }
+
   function getVisibleWorldXYBounds() {
     if (!canvas) {
       return { xMin: -100, xMax: 100, yMin: -100, yMax: 100 };
@@ -1302,7 +1321,7 @@
   function drawAxisRulerLabels(ctxLocal, project) {
     if (!canvas) return;
     const { xMin, xMax, yMin, yMax } = getVisibleWorldXYBounds();
-    const zPlane = 0;
+    const zPlane = getGridZPlane();
 
     let labelStep = niceStepMm(camPxPerMm);
     const span = Math.max(xMax - xMin, yMax - yMin);
@@ -1378,7 +1397,7 @@
   function drawInfiniteWorldGrid(ctxLocal, project) {
     if (!canvas) return;
     const { xMin, xMax, yMin, yMax } = getVisibleWorldXYBounds();
-    const zPlane = 0;
+    const zPlane = getGridZPlane();
     const step = niceStepMm(camPxPerMm);
     ctxLocal.save();
     ctxLocal.strokeStyle = 'rgba(148, 163, 184, 0.24)';
@@ -1406,11 +1425,12 @@
     if (!canvas) return;
     const w = canvas.clientWidth || canvas.width;
     const h = canvas.clientHeight || canvas.height;
+    const zPlane = getGridZPlane();
     const L = Math.max(120, (Math.hypot(w, h) / camPxPerMm) * 0.55);
-    const ox0 = project({ x: -L, y: 0, z: 0 });
-    const ox1 = project({ x: L, y: 0, z: 0 });
-    const oy0 = project({ x: 0, y: -L, z: 0 });
-    const oy1 = project({ x: 0, y: L, z: 0 });
+    const ox0 = project({ x: -L, y: 0, z: zPlane });
+    const ox1 = project({ x: L, y: 0, z: zPlane });
+    const oy0 = project({ x: 0, y: -L, z: zPlane });
+    const oy1 = project({ x: 0, y: L, z: zPlane });
     ctxLocal.save();
     ctxLocal.lineCap = 'round';
     ctxLocal.lineWidth = 2;
@@ -1424,7 +1444,6 @@
     ctxLocal.moveTo(oy0.x, oy0.y);
     ctxLocal.lineTo(oy1.x, oy1.y);
     ctxLocal.stroke();
-    const om = project({ x: 0, y: 0, z: 0 });
     ctxLocal.fillStyle = 'rgba(226, 232, 240, 0.95)';
     ctxLocal.font = '10px system-ui,sans-serif';
     ctxLocal.textAlign = 'left';
@@ -1931,11 +1950,7 @@
       if (info.fromQueue !== true && /^\$/i.test(ln.trim())) {
         appendTerminalLine(`> ${ln}`, 'sent');
       }
-      if (
-        liveCncToolSync &&
-        queueState === 'running' &&
-        info.fromQueue === true
-      ) {
+      if (liveCncToolSync && info.fromQueue === true) {
         applyLiveToolLine(info.line);
         drawToolpath();
       }
