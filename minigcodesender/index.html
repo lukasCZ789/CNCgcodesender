@@ -326,6 +326,34 @@
         justify-content: space-between;
         align-items: center;
         padding: 4px 4px 2px;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .view-mode-toggle {
+        display: inline-flex;
+        border: 1px solid var(--border-subtle);
+        border-radius: 6px;
+        overflow: hidden;
+      }
+
+      .view-mode-toggle button {
+        border: none;
+        border-radius: 0;
+        margin: 0;
+        padding: 4px 10px;
+        font-size: 10px;
+        background: transparent;
+        color: var(--muted);
+      }
+
+      .view-mode-toggle button:hover:not(:disabled) {
+        background: rgba(255, 255, 255, 0.04);
+      }
+
+      .view-mode-toggle button.active {
+        background: var(--accent-soft);
+        color: var(--accent);
       }
 
       .canvas-title {
@@ -590,7 +618,7 @@
           <div
             class="position-display"
             id="position-display"
-            title="WPos = od nulového bodu (G54). Bez WPos v reportu: MPos − ruční offset."
+            title="X Y Z vůči aktuálnímu work zero (G54). Z dat GRBL (WPos nebo MPos − WCO)."
           >
             <span><strong>X</strong>: <span id="pos-x">0.000</span></span>
             <span><strong>Y</strong>: <span id="pos-y">0.000</span></span>
@@ -641,6 +669,10 @@
         <section class="canvas-card">
           <div class="canvas-header">
             <div class="canvas-title">Toolpath</div>
+            <div class="view-mode-toggle" title="2D = pohled shora (posun tahem). 3D = rotace tahem, zoom kolečkem.">
+              <button type="button" id="view-2d-btn">2D</button>
+              <button type="button" id="view-3d-btn">3D</button>
+            </div>
             <div class="legend">
               <div class="legend-item">
                 <span class="legend-swatch rapid"></span> G0 (Rapid)

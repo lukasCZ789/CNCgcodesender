@@ -15,6 +15,9 @@ let cameraWindow = null;
 /** @type {SerialPort | null} */
 let serialPort = null;
 
+/** Poslední cesta z IPC connect (záloha, když serialPort.path v open je prázdná) */
+let lastSerialConnectPath = null;
+
 // G-code queue state
 let gcodeQueue = [];
 let currentLineIndex = 0;
@@ -31,9 +34,18 @@ let grblStatusPollTimer = null;
 // Buffer for assembling complete serial lines
 let serialLineBuffer = '';
 
-// Last reported position (from GRBL status streaming)
-/** @type {{ x: number, y: number, z: number, source: 'MPos' | 'WPos' } | null} */
+// Last reported work position (from GRBL status streaming)
+/** @type {{ x: number, y: number, z: number, source: 'WPos' | 'derived' } | null} */
 let lastReportedPosition = null;
+
+/** Cached WCO from status (WPos = MPos − WCO); used when WPos is omitted from report */
+/** @type {{ x: number, y: number, z: number } | null} */
+let lastWorkCoordOffset = null;
+
+function clearGrblPositionCache() {
+  lastReportedPosition = null;
+  lastWorkCoordOffset = null;
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -225,13 +237,13 @@ function sendNextQueuedLine() {
   writeQueuedLine(line, true);
 }
 
-// Parse GRBL status line for machine position, e.g.:
-// <Idle|MPos:1.000,2.000,0.000|WPos:0.000,0.000,0.000|FS:0,0>
-// Prefer WPos for UI and for "at work zero" checks (lift preamble), when present.
+// Parse GRBL status line for work position (vůči aktivnímu work offsetu, typicky G54).
+// <Idle|MPos:1.000,2.000,0.000|WPos:0.000,0.000,0.000|WCO:1.000,2.000,0.000|FS:0,0>
+// UI vždy dostane X/Y/Z jako WPos; pokud report WPos neobsahuje, dopočítáme MPos − WCO.
 function parseAndSendMachinePosition(line) {
   const mposM = line.match(/MPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
   const wposM = line.match(/WPos:([-\d.]+),([-\d.]+),([-\d.]+)/i);
-  if (!mposM && !wposM) return;
+  const wcoM = line.match(/WCO:([-\d.]+),([-\d.]+),([-\d.]+)/i);
 
   const read = (m) => ({
     x: Number(m[1]),
@@ -241,6 +253,7 @@ function parseAndSendMachinePosition(line) {
 
   const mpos = mposM ? read(mposM) : null;
   const wpos = wposM ? read(wposM) : null;
+  const wcoFromLine = wcoM ? read(wcoM) : null;
 
   const finite = (p) =>
     p &&
@@ -248,21 +261,37 @@ function parseAndSendMachinePosition(line) {
     Number.isFinite(p.y) &&
     Number.isFinite(p.z);
 
+  if (finite(wcoFromLine)) {
+    lastWorkCoordOffset = wcoFromLine;
+  }
+
+  if (finite(mpos) && finite(wpos)) {
+    lastWorkCoordOffset = {
+      x: mpos.x - wpos.x,
+      y: mpos.y - wpos.y,
+      z: mpos.z - wpos.z,
+    };
+  }
+
   if (finite(wpos)) {
     lastReportedPosition = { ...wpos, source: 'WPos' };
     sendToRenderer('machine:position', {
       x: wpos.x,
       y: wpos.y,
       z: wpos.z,
-      frame: 'work',
     });
-  } else if (finite(mpos)) {
-    lastReportedPosition = { ...mpos, source: 'MPos' };
+    return;
+  }
+
+  if (finite(mpos) && finite(lastWorkCoordOffset)) {
+    const wx = mpos.x - lastWorkCoordOffset.x;
+    const wy = mpos.y - lastWorkCoordOffset.y;
+    const wz = mpos.z - lastWorkCoordOffset.z;
+    lastReportedPosition = { x: wx, y: wy, z: wz, source: 'derived' };
     sendToRenderer('machine:position', {
-      x: mpos.x,
-      y: mpos.y,
-      z: mpos.z,
-      frame: 'machine',
+      x: wx,
+      y: wy,
+      z: wz,
     });
   }
 }
@@ -273,9 +302,11 @@ function attachSerialEventHandlers() {
   serialPort.on('open', () => {
     serialLineBuffer = '';
     startGrblStatusPolling();
+    const portPath =
+      (serialPort && serialPort.path) || lastSerialConnectPath || '';
     sendToRenderer('serial:status', {
       connected: true,
-      port: serialPort.path,
+      port: portPath,
       message: 'Serial port opened.',
     });
   });
@@ -289,6 +320,7 @@ function attachSerialEventHandlers() {
 
   serialPort.on('close', () => {
     stopGrblStatusPolling();
+    clearGrblPositionCache();
     sendToRenderer('serial:status', {
       connected: false,
       message: 'Serial port closed.',
@@ -354,6 +386,8 @@ ipcMain.handle('dialog:openFile', async () => {
 // IPC: connect to a GRBL device
 ipcMain.handle('serial:connect', async (_event, { path, baudRate }) => {
   stopGrblStatusPolling();
+  clearGrblPositionCache();
+  lastSerialConnectPath = path != null && String(path).trim() ? String(path).trim() : null;
   // Close existing port first
   if (serialPort && serialPort.isOpen) {
     try {
@@ -384,6 +418,7 @@ ipcMain.handle('serial:connect', async (_event, { path, baudRate }) => {
 // IPC: disconnect from GRBL
 ipcMain.handle('serial:disconnect', async () => {
   stopGrblStatusPolling();
+  clearGrblPositionCache();
   if (serialPort) {
     try {
       if (serialPort.isOpen) {
@@ -440,48 +475,79 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
     return { success: false, error: 'No G-code lines provided.' };
   }
 
-  const isNearZero = (n) => Math.abs(Number(n) || 0) <= 0.0005;
-  const hasPos = !!lastReportedPosition;
-  const atKnownZero =
-    hasPos &&
-    isNearZero(lastReportedPosition.x) &&
-    isNearZero(lastReportedPosition.y) &&
-    isNearZero(lastReportedPosition.z);
-  // Lift: vždy když neznáme pozici (žádný ještě nenačtený <?> status), nebo jsme na 0,0,0.
-  // Když GRBL hlásí jasnou pozici mimo nulu, lift nevkládat (neškubnout Z zbytečně).
-  const shouldLiftZBeforeStart = zLiftMm > 0 && (!hasPos || atKnownZero);
+  const stripGcodeComments = (raw) => {
+    let s = String(raw || '').replace(/\(.*?\)/g, '');
+    const semi = s.indexOf(';');
+    if (semi >= 0) s = s.slice(0, semi);
+    return s.trim();
+  };
 
-  const zLiftCmds = shouldLiftZBeforeStart
-    ? ['G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90']
-    : [];
+  /** X/Y token (i G0X10 — mezi číslicí a X není \b v JS). */
+  const hasAxis = (u, letter) =>
+    new RegExp(`(?:^|[^A-Z])${letter}\\s*[-+]?\\d*\\.?\\d+|(?:^|[^A-Z])${letter}\\s*[-+]?\\.\\d+`, 'i').test(
+      u,
+    );
 
+  /** První řádek, který mění X nebo Y (jako běžné CAM: G0X0Y0, X1 Y1, …). */
   const isFirstXyMotionLine = (raw) => {
-    const s = String(raw || '').trim();
+    const s = stripGcodeComments(raw);
     if (!s) return false;
-    if (s.startsWith(';') || s.startsWith('(')) return false;
     const upper = s.toUpperCase();
-    // Don't treat coordinate-setting commands as motion
     if (/\bG10\b/.test(upper)) return false;
-    const hasX = /X\s*-?\d+(\.\d+)?/.test(upper);
-    const hasY = /Y\s*-?\d+(\.\d+)?/.test(upper);
-    if (!hasX && !hasY) return false;
-    // Motion if explicit motion code, or modal coordinate move
-    const hasMotionCode = /\bG0\b|\bG00\b|\bG1\b|\bG01\b|\bG2\b|\bG02\b|\bG3\b|\bG03\b/.test(upper);
-    return hasMotionCode || hasX || hasY;
+    if (/\bT\d+\b/.test(upper) && !hasAxis(upper, 'X') && !hasAxis(upper, 'Y')) return false;
+    return hasAxis(upper, 'X') || hasAxis(upper, 'Y');
+  };
+
+  /**
+   * Jeden řádek G0/G1 s X/Y i Z → rozdělit, aby po relativním liftu nejel šikmo do materiálu.
+   * Oblouky nerozdělujeme.
+   */
+  const splitLinearXyzLine = (raw) => {
+    const cleaned = stripGcodeComments(raw);
+    if (!cleaned) return null;
+    const upper = cleaned.toUpperCase();
+    if (/\bG2\b|\bG02\b|\bG3\b|\bG03\b/.test(upper)) return null;
+    const hasX = hasAxis(upper, 'X');
+    const hasY = hasAxis(upper, 'Y');
+    const zMatch = cleaned.match(/(?:^|[^A-Z])Z\s*([-+]?\d*\.?\d+|\.\d+)/i);
+    if (!(hasX || hasY) || !zMatch) return null;
+    const xyLine = cleaned
+      .replace(/(?:^|[^A-Z])Z\s*[-+]?\d*\.?\d+/i, '')
+      .replace(/(?:^|[^A-Z])Z\s*\.\d+/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (!xyLine) return null;
+    const fMatch = cleaned.match(/\bF\s*[-+]?\d*\.?\d+/i);
+    const gLead = upper.match(/^(G00|G01|G0|G1)(?=[XYIJZFR.\d\s+-]|$)/i);
+    let g = 'G1';
+    if (gLead) {
+      const t = gLead[1].toUpperCase();
+      g = t.startsWith('G0') ? 'G0' : 'G1';
+    }
+    let zLine = `${g} Z${zMatch[1]}`;
+    if (fMatch) zLine += ` ${fMatch[0]}`;
+    return [xyLine, zLine];
   };
 
   /** @type {string[]} */
   const finalQueue = lines.slice();
 
-  // Insert Z-lift right BEFORE the first XY move so XY travel happens at safe Z,
-  // even if the file starts with a Z0 move.
-  if (zLiftCmds.length) {
+  let zLiftApplied = false;
+  if (zLiftMm > 0) {
     const idx = finalQueue.findIndex(isFirstXyMotionLine);
     if (idx >= 0) {
-      finalQueue.splice(idx, 0, ...zLiftCmds);
+      const original = finalQueue[idx];
+      const parts = splitLinearXyzLine(original);
+      if (parts) {
+        finalQueue.splice(idx, 1, parts[0], parts[1]);
+      }
+      const insertAt = finalQueue.findIndex(isFirstXyMotionLine);
+      const liftBlock = ['G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90'];
+      finalQueue.splice(insertAt >= 0 ? insertAt : 0, 0, ...liftBlock);
+      zLiftApplied = true;
     } else {
-      // No XY moves found; fall back to start
-      finalQueue.unshift(...zLiftCmds);
+      finalQueue.unshift('G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90');
+      zLiftApplied = true;
     }
   }
 
@@ -494,7 +560,7 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
 
   sendToRenderer('gcode:queueStarted', {
     total: gcodeQueue.length,
-    zLiftPreambleApplied: shouldLiftZBeforeStart,
+    zLiftPreambleApplied: zLiftApplied,
   });
 
   // Kick off the first line; subsequent ones are driven by GRBL responses

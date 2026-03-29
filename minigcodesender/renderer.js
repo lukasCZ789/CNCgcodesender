@@ -18,12 +18,6 @@
   let queuedTotal = 0;
   let sentCount = 0;
 
-  // Machine position and UI zero offsets (MPos fallback when GRBL neposílá WPos)
-  let machinePos = { x: 0, y: 0, z: 0 };
-  let offsetPos = { x: 0, y: 0, z: 0 };
-  /** @type {'work' | 'machine'} */
-  let positionFrame = 'machine';
-
   // Current G-code file
   let currentFileName = null;
   let currentGcodeLines = [];
@@ -70,7 +64,20 @@
   let liveCutPath = [];
   let liveCutPathStarted = false;
 
-  // Interactive 3D view rotation (drag on canvas)
+  // Canvas camera: world mm + pixels/mm, wheel zoom, 2D shora / 3D rotace
+  /** Jedna událost kolečka: blíž 1 = jemnější zoom (dřív ~0.92 ≈ 8 % krok) */
+  const VIEW_ZOOM_WHEEL_RATIO = 0.97;
+
+  /** @type {'2d' | '3d'} */
+  let viewMode = '2d';
+  let camCenterX = 0;
+  let camCenterY = 0;
+  let camCenterZ = 0;
+  let camPxPerMm = 4;
+  let serialConnected = false;
+  let lastWorkPosition = { x: 0, y: 0, z: 0 };
+
+  // Interactive 3D view rotation (drag on canvas); v 2D stejný tah posouvá pohled
   let viewYaw = -Math.PI / 4;   // around Z axis
   let viewPitch = 0.65;         // around X axis
   let isDraggingView = false;
@@ -87,6 +94,26 @@
     if (!s) return '';
     if (/^com\d+$/i.test(s)) return s.toUpperCase();
     if (/^\d+$/.test(s)) return `COM${s}`;
+    const winSfx = s.match(/(COM\d+)$/i);
+    if (winSfx) return winSfx[1].toUpperCase();
+    return s;
+  }
+
+  /** Jednotné uložení do localStorage (Windows → COMn) */
+  function comPathForStorage(raw) {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    const m = s.match(/(COM\d+)$/i);
+    if (m) return m[1].toUpperCase();
+    return s;
+  }
+
+  /** Hodnota do pole: u COM jen číslo, jinak celá cesta (Linux / …) */
+  function comPathForInputDisplay(stored) {
+    const s = String(stored || '').trim();
+    if (!s) return '';
+    const m = /^COM(\d+)$/i.exec(s);
+    if (m) return m[1];
     return s;
   }
 
@@ -403,8 +430,10 @@
 
   function persistLastComPort(portPath) {
     if (!portPath) return;
+    const toStore = comPathForStorage(portPath);
+    if (!toStore) return;
     try {
-      localStorage.setItem(SETTINGS.lastComPortKey, String(portPath));
+      localStorage.setItem(SETTINGS.lastComPortKey, toStore);
     } catch {
       // ignore
     }
@@ -416,8 +445,7 @@
     try {
       const raw = localStorage.getItem(SETTINGS.lastComPortKey);
       if (!raw) return;
-      const m = raw.match(/^COM(\d+)$/i);
-      input.value = m ? m[1] : raw;
+      input.value = comPathForInputDisplay(raw);
     } catch {
       // ignore
     }
@@ -463,15 +491,19 @@
     let text = '';
 
     if (error) {
+      serialConnected = false;
       statusDot.classList.add('error');
       text = `Error: ${error}`;
       appendTerminalLine(`[ERR] ${error}`, 'error');
     } else if (connected) {
+      serialConnected = true;
       statusDot.classList.add('connected');
       text = `Connected${port ? ` (${port})` : ''}`;
       if (port) persistLastComPort(port);
     } else {
+      serialConnected = false;
       text = message || 'Disconnected';
+      updateMachinePosition({ x: 0, y: 0, z: 0 });
     }
 
     statusText.textContent = text;
@@ -526,36 +558,15 @@
     const z = Number(pos.z);
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
 
-    machinePos = { x, y, z };
-    positionFrame = pos.frame === 'work' ? 'work' : 'machine';
+    lastWorkPosition = { x, y, z };
 
     const px = $('pos-x');
     const py = $('pos-y');
     const pz = $('pos-z');
-
-    if (positionFrame === 'work') {
-      if (px) px.textContent = x.toFixed(3);
-      if (py) py.textContent = y.toFixed(3);
-      if (pz) pz.textContent = z.toFixed(3);
-    } else {
-      const dx = x - offsetPos.x;
-      const dy = y - offsetPos.y;
-      const dz = z - offsetPos.z;
-      if (px) px.textContent = dx.toFixed(3);
-      if (py) py.textContent = dy.toFixed(3);
-      if (pz) pz.textContent = dz.toFixed(3);
-    }
-  }
-
-  function setAxisHome(axis) {
-    if (!machinePos) return;
-    if (axis === 'x' || axis === 'y' || axis === 'z') {
-      offsetPos[axis] = machinePos[axis];
-    } else if (axis === 'xy') {
-      offsetPos.x = machinePos.x;
-      offsetPos.y = machinePos.y;
-    }
-    updateMachinePosition(machinePos);
+    if (px) px.textContent = x.toFixed(3);
+    if (py) py.textContent = y.toFixed(3);
+    if (pz) pz.textContent = z.toFixed(3);
+    drawToolpath();
   }
 
   async function sendLines(lines) {
@@ -882,34 +893,58 @@
     ctxLocal.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
 
-  // Rotatable 3D-to-2D projection (yaw + pitch)
-  function createProjector(bounds) {
-    if (!bounds) return { project: () => ({ x: 0, y: 0 }), scale: 1 };
-    const { minX, minY, minZ, maxX, maxY, maxZ } = bounds;
-
+  function fitCameraToBounds(bounds) {
+    ensureCanvasContext();
+    if (!bounds || !canvas) return;
+    const { minX, maxX, minY, maxY, minZ, maxZ } = bounds;
+    camCenterX = (minX + maxX) / 2;
+    camCenterY = (minY + maxY) / 2;
+    camCenterZ = (minZ + maxZ) / 2;
     const spanX = maxX - minX || 1;
     const spanY = maxY - minY || 1;
     const spanZ = maxZ - minZ || 1;
+    const maxSpan = Math.max(spanX, spanY, spanZ);
+    const w = canvas.clientWidth || 400;
+    const h = canvas.clientHeight || 300;
+    camPxPerMm = (Math.min(w, h) / maxSpan) * 0.82;
+  }
 
-    const centerX = minX + spanX / 2;
-    const centerY = minY + spanY / 2;
-    const centerZ = minZ + spanZ / 2;
+  function niceStepMm(pxPerMm) {
+    const targetPx = 44;
+    const raw = targetPx / pxPerMm;
+    if (!Number.isFinite(raw) || raw <= 0) return 10;
+    const exp = Math.floor(Math.log10(raw));
+    const pow10 = Math.pow(10, exp);
+    const fr = raw / pow10;
+    const m = fr <= 1 ? 1 : fr <= 2 ? 2 : fr <= 5 ? 5 : 10;
+    return m * pow10;
+  }
 
+  function screenToWorld2d(screenX, screenY) {
+    const w = canvas ? canvas.clientWidth || 0 : 0;
+    const h = canvas ? canvas.clientHeight || 0 : 0;
+    const ppm = camPxPerMm || 1;
+    return {
+      x: camCenterX + (screenX - w / 2) / ppm,
+      y: camCenterY - (screenY - h / 2) / ppm,
+    };
+  }
+
+  /** Projekce bodu mm → obrazovka; střed pohledu = camCenter*, měřítko = camPxPerMm */
+  function createProjector() {
     const ctxLocal = ensureCanvasContext();
+    const noopP = () => ({ x: 0, y: 0 });
+    const noopR = (dx, dy, dz) => ({ x: dx, y: dy, z: dz });
     if (!canvas || !ctxLocal) {
-      return { project: () => ({ x: 0, y: 0 }), scale: 1 };
+      return { project: noopP, rotatePoint: noopR, scale: camPxPerMm };
     }
 
     const width = canvas.clientWidth || canvas.width;
     const height = canvas.clientHeight || canvas.height;
-
-    const margin = 20;
-    const maxSpan = Math.max(spanX, spanY, spanZ);
-    const scale =
-      maxSpan > 0
-        ? (Math.min(width, height) / maxSpan) * 0.8
-        : Math.min(width, height) * 0.5;
-
+    const cx = camCenterX;
+    const cy = camCenterY;
+    const cz = camCenterZ;
+    const ppm = camPxPerMm;
     const centerScreenX = width / 2;
     const centerScreenY = height / 2;
 
@@ -918,31 +953,41 @@
     const cosPitch = Math.cos(viewPitch);
     const sinPitch = Math.sin(viewPitch);
 
-    function rotatePoint(dx, dy, dz) {
-      // Yaw around Z axis
+    function rotatePoint3d(dx, dy, dz) {
       const x1 = dx * cosYaw - dy * sinYaw;
       const y1 = dx * sinYaw + dy * cosYaw;
       const z1 = dz;
-
-      // Pitch around X axis
       const x2 = x1;
       const y2 = y1 * cosPitch - z1 * sinPitch;
       const z2 = y1 * sinPitch + z1 * cosPitch;
       return { x: x2, y: y2, z: z2 };
     }
 
+    function rotatePoint(dx, dy, dz) {
+      if (viewMode === '2d') {
+        return { x: dx, y: dy, z: dz };
+      }
+      return rotatePoint3d(dx, dy, dz);
+    }
+
     const project = (point) => {
-      const dx = point.x - centerX;
-      const dy = point.y - centerY;
-      const dz = point.z - centerZ;
-
-      const rotated = rotatePoint(dx, dy, dz);
-
-      const sx = centerScreenX + rotated.x * scale;
-      const sy = centerScreenY + rotated.y * scale;
-      return { x: sx, y: sy };
+      const dx = point.x - cx;
+      const dy = point.y - cy;
+      const dz = point.z - cz;
+      if (viewMode === '2d') {
+        return {
+          x: centerScreenX + dx * ppm,
+          y: centerScreenY - dy * ppm,
+        };
+      }
+      const rotated = rotatePoint3d(dx, dy, dz);
+      return {
+        x: centerScreenX + rotated.x * ppm,
+        y: centerScreenY + rotated.y * ppm,
+      };
     };
-    return { project, scale, rotatePoint };
+
+    return { project, rotatePoint, scale: ppm };
   }
 
   function clearCanvas() {
@@ -954,6 +999,93 @@
     ctxLocal.restore();
   }
 
+  /** Poloha vrtáku: offline simulace > živý stroj (WPos) > odvozeno z fronty G-kódu */
+  function getToolDisplayPoint() {
+    if (simulationState.running && simulationState.currentPoint) {
+      return { ...simulationState.currentPoint };
+    }
+    if (serialConnected) {
+      return { ...lastWorkPosition };
+    }
+    if (liveCncToolSync && simulationState.currentPoint) {
+      return { ...simulationState.currentPoint };
+    }
+    return null;
+  }
+
+  function drawToolCylinderAt(ctxLocal, point, project, rotatePoint, scale) {
+    if (!point) return;
+    const pBottom = project(point);
+    const toolDiameterMm = readToolDiameterFromUi();
+    const rimRadiusPx = Math.max(3, (toolDiameterMm * scale) / 2);
+    const cylinderHeightMm = Math.max(toolDiameterMm * 6, 30);
+    const toolTopPoint = {
+      x: point.x,
+      y: point.y,
+      z: point.z + cylinderHeightMm,
+    };
+    const pTop = project(toolTopPoint);
+
+    const local = rotatePoint(
+      point.x - camCenterX,
+      point.y - camCenterY,
+      point.z - camCenterZ,
+    );
+    const localRim = rotatePoint(
+      point.x + toolDiameterMm / 2 - camCenterX,
+      point.y - camCenterY,
+      point.z - camCenterZ,
+    );
+    const rimPx = Math.max(2, Math.abs(localRim.x - local.x) * scale);
+    const ellipseRy =
+      viewMode === '2d'
+        ? rimPx
+        : Math.max(2, rimPx * (0.35 + 0.35 * Math.abs(Math.sin(viewPitch))));
+
+    const isLiveMachine = serialConnected && !simulationState.running;
+    const wall = isLiveMachine
+      ? 'rgba(56, 178, 172, 0.7)'
+      : 'rgba(220, 38, 38, 0.72)';
+    const top = isLiveMachine
+      ? 'rgba(79, 209, 197, 0.95)'
+      : 'rgba(239, 68, 68, 0.95)';
+    const bottom = isLiveMachine
+      ? 'rgba(45, 127, 120, 0.85)'
+      : 'rgba(185, 28, 28, 0.85)';
+    const strokeTop = isLiveMachine
+      ? 'rgba(204, 251, 241, 0.9)'
+      : 'rgba(254, 202, 202, 0.95)';
+
+    ctxLocal.save();
+
+    ctxLocal.beginPath();
+    ctxLocal.moveTo(pBottom.x - rimPx, pBottom.y);
+    ctxLocal.lineTo(pTop.x - rimPx, pTop.y);
+    ctxLocal.lineTo(pTop.x + rimPx, pTop.y);
+    ctxLocal.lineTo(pBottom.x + rimPx, pBottom.y);
+    ctxLocal.closePath();
+    ctxLocal.fillStyle = wall;
+    ctxLocal.fill();
+
+    ctxLocal.beginPath();
+    ctxLocal.ellipse(pTop.x, pTop.y, rimPx, ellipseRy, 0, 0, Math.PI * 2);
+    ctxLocal.fillStyle = top;
+    ctxLocal.fill();
+
+    ctxLocal.beginPath();
+    ctxLocal.ellipse(pBottom.x, pBottom.y, rimPx, ellipseRy, 0, 0, Math.PI * 2);
+    ctxLocal.fillStyle = bottom;
+    ctxLocal.fill();
+
+    ctxLocal.strokeStyle = strokeTop;
+    ctxLocal.lineWidth = 1.2;
+    ctxLocal.beginPath();
+    ctxLocal.ellipse(pTop.x, pTop.y, rimPx, ellipseRy, 0, 0, Math.PI * 2);
+    ctxLocal.stroke();
+
+    ctxLocal.restore();
+  }
+
   function drawToolpath() {
     const ctxLocal = ensureCanvasContext();
     if (!canvas || !ctxLocal) return;
@@ -961,140 +1093,75 @@
     resizeCanvas();
     clearCanvas();
 
-    if (!toolpathSegments.length || !toolpathBounds) {
-      // Draw subtle grid even when empty
-      drawGrid(ctxLocal);
-      return;
-    }
+    const { project, rotatePoint, scale } = createProjector();
+    drawInfiniteWorldGrid(ctxLocal, project);
+    drawWorldAxes(ctxLocal, project);
+    drawAxisRulerLabels(ctxLocal, project);
 
-    drawGrid(ctxLocal);
+    if (toolpathSegments.length && toolpathBounds) {
+      ctxLocal.lineWidth = 1;
+      ctxLocal.lineCap = 'round';
+      ctxLocal.lineJoin = 'round';
 
-    const { project, scale, rotatePoint } = createProjector(toolpathBounds);
+      for (let i = 0; i < toolpathSegments.length; i += 1) {
+        const seg = toolpathSegments[i];
+        const from = project(seg.from);
+        const to = project(seg.to);
 
-    ctxLocal.lineWidth = 1;
-    ctxLocal.lineCap = 'round';
-    ctxLocal.lineJoin = 'round';
+        ctxLocal.beginPath();
+        ctxLocal.moveTo(from.x, from.y);
+        ctxLocal.lineTo(to.x, to.y);
+        ctxLocal.strokeStyle =
+          seg.type === 'rapid'
+            ? getComputedStyle(document.documentElement)
+                .getPropertyValue('--rapid')
+                .trim() || '#4299e1'
+            : getComputedStyle(document.documentElement)
+                .getPropertyValue('--linear')
+                .trim() || '#48bb78';
+        ctxLocal.stroke();
 
-    for (let i = 0; i < toolpathSegments.length; i += 1) {
-      const seg = toolpathSegments[i];
-      const from = project(seg.from);
-      const to = project(seg.to);
-
-      ctxLocal.beginPath();
-      ctxLocal.moveTo(from.x, from.y);
-      ctxLocal.lineTo(to.x, to.y);
-      ctxLocal.strokeStyle =
-        seg.type === 'rapid'
-          ? getComputedStyle(document.documentElement)
-              .getPropertyValue('--rapid')
-              .trim() || '#4299e1'
-          : getComputedStyle(document.documentElement)
-              .getPropertyValue('--linear')
-              .trim() || '#48bb78';
-      ctxLocal.stroke();
-
-      // Žlutý „řez“: buď z reálného běhu (G1 body), nebo offline simulace.
-      if (!(liveCutPath.length >= 2)) {
-        if (simulationState.running || simulationState.currentPoint) {
-          const isCompleted = i < simulationState.segmentIndex;
-          const isCurrent = i === simulationState.segmentIndex;
-          if (seg.type === 'linear' && (isCompleted || isCurrent)) {
-            const cutTo = isCurrent
-              ? {
-                  x: from.x + (to.x - from.x) * simulationState.segmentT,
-                  y: from.y + (to.y - from.y) * simulationState.segmentT,
-                }
-              : to;
-            ctxLocal.beginPath();
-            ctxLocal.moveTo(from.x, from.y);
-            ctxLocal.lineTo(cutTo.x, cutTo.y);
-            ctxLocal.strokeStyle = '#f6e05e';
-            ctxLocal.lineWidth = 2;
-            ctxLocal.stroke();
-            ctxLocal.lineWidth = 1;
+        if (!(liveCutPath.length >= 2)) {
+          if (simulationState.running || simulationState.currentPoint) {
+            const isCompleted = i < simulationState.segmentIndex;
+            const isCurrent = i === simulationState.segmentIndex;
+            if (seg.type === 'linear' && (isCompleted || isCurrent)) {
+              const cutTo = isCurrent
+                ? {
+                    x: from.x + (to.x - from.x) * simulationState.segmentT,
+                    y: from.y + (to.y - from.y) * simulationState.segmentT,
+                  }
+                : to;
+              ctxLocal.beginPath();
+              ctxLocal.moveTo(from.x, from.y);
+              ctxLocal.lineTo(cutTo.x, cutTo.y);
+              ctxLocal.strokeStyle = '#f6e05e';
+              ctxLocal.lineWidth = 2;
+              ctxLocal.stroke();
+              ctxLocal.lineWidth = 1;
+            }
           }
         }
       }
-    }
 
-    if (liveCutPath.length >= 2) {
-      ctxLocal.beginPath();
-      const p0 = project(liveCutPath[0]);
-      ctxLocal.moveTo(p0.x, p0.y);
-      for (let k = 1; k < liveCutPath.length; k++) {
-        const p = project(liveCutPath[k]);
-        ctxLocal.lineTo(p.x, p.y);
+      if (liveCutPath.length >= 2) {
+        ctxLocal.beginPath();
+        const p0 = project(liveCutPath[0]);
+        ctxLocal.moveTo(p0.x, p0.y);
+        for (let k = 1; k < liveCutPath.length; k++) {
+          const p = project(liveCutPath[k]);
+          ctxLocal.lineTo(p.x, p.y);
+        }
+        ctxLocal.strokeStyle = '#f6e05e';
+        ctxLocal.lineWidth = 2;
+        ctxLocal.stroke();
+        ctxLocal.lineWidth = 1;
       }
-      ctxLocal.strokeStyle = '#f6e05e';
-      ctxLocal.lineWidth = 2;
-      ctxLocal.stroke();
-      ctxLocal.lineWidth = 1;
     }
 
-    // Draw cutter as a tall red cylinder.
-    if (simulationState.currentPoint) {
-      const pBottom = project(simulationState.currentPoint);
-      const toolDiameterMm = readToolDiameterFromUi();
-      const radiusPx = Math.max(3, (toolDiameterMm * scale) / 2);
-      const cylinderHeightMm = Math.max(toolDiameterMm * 6, 30);
-      const toolTopPoint = {
-        x: simulationState.currentPoint.x,
-        y: simulationState.currentPoint.y,
-        z: simulationState.currentPoint.z + cylinderHeightMm,
-      };
-      const pTop = project(toolTopPoint);
-
-      // Compute how circular top/bottom appear after rotation.
-      const center = toolpathBounds
-        ? {
-            x: (toolpathBounds.minX + toolpathBounds.maxX) / 2,
-            y: (toolpathBounds.minY + toolpathBounds.maxY) / 2,
-            z: (toolpathBounds.minZ + toolpathBounds.maxZ) / 2,
-          }
-        : { x: 0, y: 0, z: 0 };
-      const local = rotatePoint(
-        simulationState.currentPoint.x - center.x,
-        simulationState.currentPoint.y - center.y,
-        simulationState.currentPoint.z - center.z,
-      );
-      const localRim = rotatePoint(
-        simulationState.currentPoint.x + toolDiameterMm / 2 - center.x,
-        simulationState.currentPoint.y - center.y,
-        simulationState.currentPoint.z - center.z,
-      );
-      const rimRadiusPx = Math.max(2, Math.abs(localRim.x - local.x) * scale);
-      const ellipseRy = Math.max(2, rimRadiusPx * (0.35 + 0.35 * Math.abs(Math.sin(viewPitch))));
-
-      ctxLocal.save();
-
-      // Side wall
-      ctxLocal.beginPath();
-      ctxLocal.moveTo(pBottom.x - rimRadiusPx, pBottom.y);
-      ctxLocal.lineTo(pTop.x - rimRadiusPx, pTop.y);
-      ctxLocal.lineTo(pTop.x + rimRadiusPx, pTop.y);
-      ctxLocal.lineTo(pBottom.x + rimRadiusPx, pBottom.y);
-      ctxLocal.closePath();
-      ctxLocal.fillStyle = 'rgba(220, 38, 38, 0.72)';
-      ctxLocal.fill();
-
-      // Top cap
-      ctxLocal.beginPath();
-      ctxLocal.ellipse(pTop.x, pTop.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
-      ctxLocal.fillStyle = 'rgba(239, 68, 68, 0.95)';
-      ctxLocal.fill();
-
-      // Bottom cap
-      ctxLocal.beginPath();
-      ctxLocal.ellipse(pBottom.x, pBottom.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
-      ctxLocal.fillStyle = 'rgba(185, 28, 28, 0.85)';
-      ctxLocal.fill();
-
-      ctxLocal.strokeStyle = 'rgba(254, 202, 202, 0.95)';
-      ctxLocal.lineWidth = 1.2;
-      ctxLocal.beginPath();
-      ctxLocal.ellipse(pTop.x, pTop.y, rimRadiusPx, ellipseRy, 0, 0, Math.PI * 2);
-      ctxLocal.stroke();
-      ctxLocal.restore();
+    const toolPt = getToolDisplayPoint();
+    if (toolPt) {
+      drawToolCylinderAt(ctxLocal, toolPt, project, rotatePoint, scale);
     }
   }
 
@@ -1200,35 +1267,170 @@
     simulationRaf = requestAnimationFrame(stepSimulation);
   }
 
-  function drawGrid(ctxLocal) {
+  function getVisibleWorldXYBounds() {
+    if (!canvas) {
+      return { xMin: -100, xMax: 100, yMin: -100, yMax: 100 };
+    }
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    const ppm = camPxPerMm || 1;
+    if (viewMode === '2d') {
+      return {
+        xMin: camCenterX - w / (2 * ppm),
+        xMax: camCenterX + w / (2 * ppm),
+        yMin: camCenterY - h / (2 * ppm),
+        yMax: camCenterY + h / (2 * ppm),
+      };
+    }
+    const reach = Math.hypot(w, h) / ppm;
+    return {
+      xMin: camCenterX - reach,
+      xMax: camCenterX + reach,
+      yMin: camCenterY - reach,
+      yMax: camCenterY + reach,
+    };
+  }
+
+  function formatAxisNumber(val, step) {
+    if (Math.abs(val) < 1e-9) return '0';
+    if (step >= 1) return String(Math.round(val));
+    const dec = step >= 0.1 ? 1 : 2;
+    return String(Number(val.toFixed(dec)));
+  }
+
+  /** Měřítko na osách: dílce + hodnoty (mm) jako na technickém výkrese */
+  function drawAxisRulerLabels(ctxLocal, project) {
     if (!canvas) return;
-    const width = canvas.clientWidth || canvas.width;
-    const height = canvas.clientHeight || canvas.height;
+    const { xMin, xMax, yMin, yMax } = getVisibleWorldXYBounds();
+    const zPlane = 0;
 
+    let labelStep = niceStepMm(camPxPerMm);
+    const span = Math.max(xMax - xMin, yMax - yMin);
+    while (span / labelStep > 24) labelStep *= 2;
+    while (span / labelStep < 5 && labelStep > 1e-4) labelStep *= 0.5;
+
+    const O = project({ x: 0, y: 0, z: zPlane });
+    const Px = project({ x: labelStep, y: 0, z: zPlane });
+    const Py = project({ x: 0, y: labelStep, z: zPlane });
+    const norm = (vx, vy) => {
+      const l = Math.hypot(vx, vy) || 1;
+      return { x: vx / l, y: vy / l };
+    };
+    const tx = norm(Px.x - O.x, Px.y - O.y);
+    const ty = norm(Py.x - O.x, Py.y - O.y);
+    let nx = norm(-tx.y, tx.x);
+    if (nx.x * ty.x + nx.y * ty.y > 0) {
+      nx = { x: -nx.x, y: -nx.y };
+    }
+    let ny = norm(-ty.y, ty.x);
+    if (ny.x * tx.x + ny.y * tx.y > 0) {
+      ny = { x: -ny.x, y: -ny.y };
+    }
+
+    const tickPx = 6;
+    const labelPx = 12;
     ctxLocal.save();
-    ctxLocal.strokeStyle = 'rgba(148, 163, 184, 0.16)';
-    ctxLocal.lineWidth = 0.5;
+    ctxLocal.lineCap = 'round';
+    ctxLocal.font =
+      '11px ui-monospace, "Cascadia Mono", "JetBrains Mono", Consolas, monospace';
+    ctxLocal.textAlign = 'center';
+    ctxLocal.textBaseline = 'middle';
 
-    const step = 40;
-    for (let x = 0; x < width; x += step) {
+    for (let gx = Math.floor(xMin / labelStep) * labelStep; gx <= xMax + 1e-6; gx += labelStep) {
+      if (Math.abs(gx) < 1e-9) continue;
+      const p = project({ x: gx, y: 0, z: zPlane });
+      ctxLocal.strokeStyle = 'rgba(229, 62, 62, 0.82)';
+      ctxLocal.lineWidth = 1;
       ctxLocal.beginPath();
-      ctxLocal.moveTo(x, 0);
-      ctxLocal.lineTo(x, height);
+      ctxLocal.moveTo(p.x - nx.x * tickPx, p.y - nx.y * tickPx);
+      ctxLocal.lineTo(p.x + nx.x * tickPx, p.y + nx.y * tickPx);
+      ctxLocal.stroke();
+      ctxLocal.fillStyle = 'rgba(254, 178, 178, 0.98)';
+      ctxLocal.fillText(
+        formatAxisNumber(gx, labelStep),
+        p.x + nx.x * labelPx,
+        p.y + nx.y * labelPx,
+      );
+    }
+
+    for (let gy = Math.floor(yMin / labelStep) * labelStep; gy <= yMax + 1e-6; gy += labelStep) {
+      if (Math.abs(gy) < 1e-9) continue;
+      const p = project({ x: 0, y: gy, z: zPlane });
+      ctxLocal.strokeStyle = 'rgba(72, 187, 120, 0.82)';
+      ctxLocal.beginPath();
+      ctxLocal.moveTo(p.x - ny.x * tickPx, p.y - ny.y * tickPx);
+      ctxLocal.lineTo(p.x + ny.x * tickPx, p.y + ny.y * tickPx);
+      ctxLocal.stroke();
+      ctxLocal.fillStyle = 'rgba(154, 230, 180, 0.98)';
+      ctxLocal.fillText(
+        formatAxisNumber(gy, labelStep),
+        p.x + ny.x * labelPx,
+        p.y + ny.y * labelPx,
+      );
+    }
+
+    ctxLocal.fillStyle = 'rgba(226, 232, 240, 0.95)';
+    ctxLocal.fillText('0', O.x - nx.x * (labelPx * 0.85) - ny.x * (labelPx * 0.35), O.y - nx.y * (labelPx * 0.85) - ny.y * (labelPx * 0.35));
+
+    ctxLocal.restore();
+  }
+
+  function drawInfiniteWorldGrid(ctxLocal, project) {
+    if (!canvas) return;
+    const { xMin, xMax, yMin, yMax } = getVisibleWorldXYBounds();
+    const zPlane = 0;
+    const step = niceStepMm(camPxPerMm);
+    ctxLocal.save();
+    ctxLocal.strokeStyle = 'rgba(148, 163, 184, 0.24)';
+    ctxLocal.lineWidth = 1;
+    for (let gx = Math.floor(xMin / step) * step; gx <= xMax + 1e-6; gx += step) {
+      const a = project({ x: gx, y: yMin, z: zPlane });
+      const b = project({ x: gx, y: yMax, z: zPlane });
+      ctxLocal.beginPath();
+      ctxLocal.moveTo(a.x, a.y);
+      ctxLocal.lineTo(b.x, b.y);
       ctxLocal.stroke();
     }
-    for (let y = 0; y < height; y += step) {
+    for (let gy = Math.floor(yMin / step) * step; gy <= yMax + 1e-6; gy += step) {
+      const a = project({ x: xMin, y: gy, z: zPlane });
+      const b = project({ x: xMax, y: gy, z: zPlane });
       ctxLocal.beginPath();
-      ctxLocal.moveTo(0, y);
-      ctxLocal.lineTo(width, y);
+      ctxLocal.moveTo(a.x, a.y);
+      ctxLocal.lineTo(b.x, b.y);
       ctxLocal.stroke();
     }
+    ctxLocal.restore();
+  }
 
-    // Origin marker
-    ctxLocal.fillStyle = 'rgba(72, 187, 120, 0.9)';
+  function drawWorldAxes(ctxLocal, project) {
+    if (!canvas) return;
+    const w = canvas.clientWidth || canvas.width;
+    const h = canvas.clientHeight || canvas.height;
+    const L = Math.max(120, (Math.hypot(w, h) / camPxPerMm) * 0.55);
+    const ox0 = project({ x: -L, y: 0, z: 0 });
+    const ox1 = project({ x: L, y: 0, z: 0 });
+    const oy0 = project({ x: 0, y: -L, z: 0 });
+    const oy1 = project({ x: 0, y: L, z: 0 });
+    ctxLocal.save();
+    ctxLocal.lineCap = 'round';
+    ctxLocal.lineWidth = 2;
+    ctxLocal.strokeStyle = 'rgba(229, 62, 62, 0.88)';
     ctxLocal.beginPath();
-    ctxLocal.arc(24, height - 24, 3, 0, Math.PI * 2);
-    ctxLocal.fill();
-
+    ctxLocal.moveTo(ox0.x, ox0.y);
+    ctxLocal.lineTo(ox1.x, ox1.y);
+    ctxLocal.stroke();
+    ctxLocal.strokeStyle = 'rgba(72, 187, 120, 0.88)';
+    ctxLocal.beginPath();
+    ctxLocal.moveTo(oy0.x, oy0.y);
+    ctxLocal.lineTo(oy1.x, oy1.y);
+    ctxLocal.stroke();
+    const om = project({ x: 0, y: 0, z: 0 });
+    ctxLocal.fillStyle = 'rgba(226, 232, 240, 0.95)';
+    ctxLocal.font = '10px system-ui,sans-serif';
+    ctxLocal.textAlign = 'left';
+    ctxLocal.fillText('X', ox1.x + 4, ox1.y + 3);
+    ctxLocal.textAlign = 'left';
+    ctxLocal.fillText('Y', oy1.x + 4, oy1.y + 3);
     ctxLocal.restore();
   }
 
@@ -1237,6 +1439,9 @@
     const parsed = parseGcode(currentGcodeLines);
     toolpathSegments = parsed.segments;
     toolpathBounds = parsed.bounds;
+    if (toolpathBounds) {
+      fitCameraToBounds(toolpathBounds);
+    }
 
     sentCount = 0;
     queuedTotal = 0;
@@ -1297,6 +1502,13 @@
 
   // --- UI wiring -----------------------------------------------------------
 
+  function syncViewModeButtons() {
+    const b2 = $('view-2d-btn');
+    const b3 = $('view-3d-btn');
+    if (b2) b2.classList.toggle('active', viewMode === '2d');
+    if (b3) b3.classList.toggle('active', viewMode === '3d');
+  }
+
   function wireUI() {
     canvas = /** @type {HTMLCanvasElement} */ (
       document.getElementById('toolpathCanvas')
@@ -1319,14 +1531,60 @@
         lastDragX = event.clientX;
         lastDragY = event.clientY;
 
-        viewYaw += dx * 0.01;
-        viewPitch += dy * 0.01;
-        // Yaw keep bounded for numeric stability; pitch intentionally unbounded.
-        const tau = Math.PI * 2;
-        viewYaw = ((viewYaw % tau) + tau) % tau;
+        if (viewMode === '2d') {
+          camCenterX -= dx / camPxPerMm;
+          camCenterY += dy / camPxPerMm;
+        } else {
+          viewYaw += dx * 0.01;
+          viewPitch += dy * 0.01;
+          const tau = Math.PI * 2;
+          viewYaw = ((viewYaw % tau) + tau) % tau;
+        }
         drawToolpath();
       });
+
+      canvas.addEventListener(
+        'wheel',
+        (e) => {
+          e.preventDefault();
+          const rect = canvas.getBoundingClientRect();
+          const mx = e.clientX - rect.left;
+          const my = e.clientY - rect.top;
+          const zoomFactor =
+            e.deltaY > 0 ? VIEW_ZOOM_WHEEL_RATIO : 1 / VIEW_ZOOM_WHEEL_RATIO;
+          const next = Math.max(0.02, Math.min(500, camPxPerMm * zoomFactor));
+          if (viewMode === '2d') {
+            const before = screenToWorld2d(mx, my);
+            camPxPerMm = next;
+            const after = screenToWorld2d(mx, my);
+            camCenterX += before.x - after.x;
+            camCenterY += before.y - after.y;
+          } else {
+            camPxPerMm = next;
+          }
+          drawToolpath();
+        },
+        { passive: false },
+      );
+
+      const btn2d = $('view-2d-btn');
+      const btn3d = $('view-3d-btn');
+      if (btn2d) {
+        btn2d.addEventListener('click', () => {
+          viewMode = '2d';
+          syncViewModeButtons();
+          drawToolpath();
+        });
+      }
+      if (btn3d) {
+        btn3d.addEventListener('click', () => {
+          viewMode = '3d';
+          syncViewModeButtons();
+          drawToolpath();
+        });
+      }
     }
+    syncViewModeButtons();
 
     const openFileBtn = $('open-file-btn');
     const startBtn = $('start-btn');
