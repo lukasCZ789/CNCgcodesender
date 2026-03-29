@@ -18,6 +18,12 @@ let serialPort = null;
 /** Poslední cesta z IPC connect (záloha, když serialPort.path v open je prázdná) */
 let lastSerialConnectPath = null;
 
+/** Baud z posledního úspěšného připojení (pro znovuotevření po Stop) */
+let lastSerialBaudRate = 115200;
+
+/** Zavření portu po Stop — neposílat „disconnected“ (hned se znovu otevře) */
+let suppressSerialCloseBroadcast = false;
+
 // G-code queue state
 let gcodeQueue = [];
 let currentLineIndex = 0;
@@ -321,6 +327,10 @@ function attachSerialEventHandlers() {
   serialPort.on('close', () => {
     stopGrblStatusPolling();
     clearGrblPositionCache();
+    if (suppressSerialCloseBroadcast) {
+      suppressSerialCloseBroadcast = false;
+      return;
+    }
     sendToRenderer('serial:status', {
       connected: false,
       message: 'Serial port closed.',
@@ -397,9 +407,11 @@ ipcMain.handle('serial:connect', async (_event, { path, baudRate }) => {
     }
   }
 
+  lastSerialBaudRate = Number(baudRate) || 115200;
+
   serialPort = new SerialPort({
     path,
-    baudRate: Number(baudRate) || 115200,
+    baudRate: lastSerialBaudRate,
     autoOpen: true,
   });
 
@@ -598,32 +610,103 @@ ipcMain.handle('gcode:resume', async () => {
   return { success: true };
 });
 
-// IPC: stop queue — soft reset GRBL vyčistí buffer; pak $X odemkne alarm (error:9 bez $X)
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Stop programu: GRBL reset (Ctrl+X), krátká pauza, zavření COM a znovuotevření —
+ * čistý stav bez zaseknutí / chyb z alarmu po soft resetu.
+ */
 ipcMain.handle('gcode:stop', async () => {
-  if (serialPort && serialPort.isOpen) {
-    try {
-      serialPort.write(Buffer.from([0x18]));
-    } catch {
-      try {
-        serialPort.write('!\n');
-      } catch {
-        // ignore
-      }
-    }
-  }
   resetQueue();
   sendToRenderer('gcode:aborted', {});
-  if (serialPort && serialPort.isOpen) {
-    setTimeout(() => {
-      if (!serialPort || !serialPort.isOpen) return;
-      try {
+
+  const reopenPath =
+    lastSerialConnectPath ||
+    (serialPort && serialPort.path ? String(serialPort.path) : null);
+  const reopenBaud = lastSerialBaudRate;
+
+  if (!serialPort || !serialPort.isOpen) {
+    return { success: true };
+  }
+
+  try {
+    serialPort.write(Buffer.from([0x18]));
+  } catch {
+    try {
+      serialPort.write('!\n');
+    } catch {
+      // ignore
+    }
+  }
+
+  await delay(220);
+
+  if (!reopenPath) {
+    try {
+      if (serialPort && serialPort.isOpen) {
         serialPort.write('$X\n');
         sendToRenderer('gcode:sentLine', { line: '$X', fromQueue: false });
-      } catch {
-        // ignore
       }
-    }, 200);
+    } catch {
+      // ignore
+    }
+    return { success: true };
   }
+
+  suppressSerialCloseBroadcast = true;
+  stopGrblStatusPolling();
+
+  await new Promise((resolve) => {
+    const p = serialPort;
+    if (!p) {
+      suppressSerialCloseBroadcast = false;
+      resolve();
+      return;
+    }
+    if (p.isOpen) {
+      p.close(() => {
+        serialPort = null;
+        resolve();
+      });
+    } else {
+      serialPort = null;
+      suppressSerialCloseBroadcast = false;
+      resolve();
+    }
+  });
+
+  clearGrblPositionCache();
+
+  sendToRenderer('serial:status', {
+    connected: false,
+    port: reopenPath,
+    message: 'Po Stop se znovu otevírá sériový port…',
+  });
+
+  await delay(180);
+
+  try {
+    serialPort = new SerialPort({
+      path: reopenPath,
+      baudRate: reopenBaud,
+      autoOpen: true,
+    });
+    attachSerialEventHandlers();
+    sendToRenderer('serial:status', {
+      connected: false,
+      port: reopenPath,
+      message: 'Opening serial port...',
+    });
+  } catch (err) {
+    sendToRenderer('serial:status', {
+      connected: false,
+      error: `Po Stop se nepodařilo znovu otevřít port: ${err.message || String(err)}`,
+    });
+    return { success: false, error: err.message || String(err) };
+  }
+
   return { success: true };
 });
 

@@ -1982,7 +1982,7 @@
         resetSimulation();
         drawToolpath();
         appendTerminalLine(
-          '[SYS] Stop — program zastaven, fronta vynulována. Následuje $X (unlock).',
+          '[SYS] Stop — program zastaven. Sériový port se krátce znovu otevře (čistý stav GRBL).',
           'system',
         );
       });
