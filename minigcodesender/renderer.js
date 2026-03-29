@@ -29,6 +29,7 @@
   let currentGcodeLines = [];
 
   const SETTINGS = {
+    lastComPortKey: 'settings.lastComPortPath',
     zLiftMmKey: 'settings.zLiftMm',
     defaultZLiftMm: 10,
     toolDiameterMmKey: 'settings.toolDiameterMm',
@@ -400,6 +401,38 @@
     }
   }
 
+  function persistLastComPort(portPath) {
+    if (!portPath) return;
+    try {
+      localStorage.setItem(SETTINGS.lastComPortKey, String(portPath));
+    } catch {
+      // ignore
+    }
+  }
+
+  function loadLastComPortIntoInput() {
+    const input = /** @type {HTMLInputElement | null} */ ($('port-input'));
+    if (!input) return;
+    try {
+      const raw = localStorage.getItem(SETTINGS.lastComPortKey);
+      if (!raw) return;
+      const m = raw.match(/^COM(\d+)$/i);
+      input.value = m ? m[1] : raw;
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Méně šumu: status <?>, holá ok, běžné echo */
+  function shouldLogSerialRecv(line) {
+    const t = String(line || '').trim();
+    if (!t) return false;
+    if (t.startsWith('<')) return false;
+    if (/^ok\s*$/i.test(t)) return false;
+    if (/^\[echo:/i.test(t)) return false;
+    return true;
+  }
+
   function appendTerminalLine(text, type) {
     const terminal = $('terminal');
     if (!terminal) return;
@@ -436,6 +469,7 @@
     } else if (connected) {
       statusDot.classList.add('connected');
       text = `Connected${port ? ` (${port})` : ''}`;
+      if (port) persistLastComPort(port);
     } else {
       text = message || 'Disconnected';
     }
@@ -557,7 +591,7 @@
 
     const ok = await sendLines(['G90', 'G54', cmd]);
     if (ok) {
-      appendTerminalLine(`[SYS] Set work zero (${axis.toUpperCase()})`, 'system');
+      appendTerminalLine(`[SYS] Nula ${axis.toUpperCase()}`, 'system');
     }
   }
 
@@ -571,7 +605,7 @@
         ? 'G0 Y0'
         : 'G0 Z0';
     const ok = await sendLines(['G90', 'G54', cmd]);
-    if (ok) appendTerminalLine(`[SYS] Go to ${which.toUpperCase()}0`, 'system');
+    if (ok) appendTerminalLine(`[SYS] Jedu na ${which.toUpperCase()}0`, 'system');
   }
 
   function cleanRawGcodeLine(raw) {
@@ -1147,7 +1181,7 @@
       simulationRaf = requestAnimationFrame(stepSimulation);
     } else {
       simulationRaf = null;
-      appendTerminalLine('[SYS] Cut simulation complete.', 'system');
+      appendTerminalLine('[SYS] Simulace hotová.', 'system');
     }
   }
 
@@ -1162,10 +1196,7 @@
     resetSimulation();
     simulationState.running = true;
     simulationState.lastTs = 0;
-    appendTerminalLine(
-      `[SYS] Simulating cut with tool diameter ${readToolDiameterFromUi().toFixed(2)} mm.`,
-      'system',
-    );
+    appendTerminalLine('[SYS] Simulace řezu.', 'system');
     simulationRaf = requestAnimationFrame(stepSimulation);
   }
 
@@ -1229,10 +1260,7 @@
       if (startBtn) startBtn.disabled = false;
     }
 
-    appendTerminalLine(
-      `[SYS] Loaded G-code file with ${currentGcodeLines.length} lines.`,
-      'system',
-    );
+    appendTerminalLine(`[SYS] Soubor: ${currentGcodeLines.length} řádků`, 'system');
   }
 
   /**
@@ -1258,10 +1286,7 @@
         );
         return;
       }
-      appendTerminalLine(
-        `[OUT] JOG ${axis}${direction} ${steps} kroků (${stepMm.toFixed(3)} mm)`,
-        'sent',
-      );
+      appendTerminalLine(`[OUT] Jog ${axis}${direction} ${steps} kroků`, 'sent');
     } catch (err) {
       appendTerminalLine(
         `[ERR] Jog failed: ${err.message || String(err)}`,
@@ -1317,6 +1342,7 @@
     loadSettingsIntoUi();
     loadToolDiameterIntoUi();
     loadJogStepsIntoUi();
+    loadLastComPortIntoInput();
 
     const jogStepInput = /** @type {HTMLInputElement | null} */ ($('jog-step-input'));
     if (jogStepInput) {
@@ -1389,7 +1415,7 @@
               return;
             }
             setQueueState('running');
-            appendTerminalLine('[SYS] Queue resumed.', 'system');
+            appendTerminalLine('[SYS] Pokračuji.', 'system');
           } else if (queueState === 'idle') {
             // Start from beginning
             sentCount = 0;
@@ -1417,10 +1443,7 @@
             }
             queuedTotal = res.total || currentGcodeLines.length;
             setQueueState('running');
-            appendTerminalLine(
-              `[SYS] Queue started with ${queuedTotal} lines.`,
-              'system',
-            );
+            appendTerminalLine('[SYS] Start programu.', 'system');
           }
         } catch (err) {
           appendTerminalLine(
@@ -1446,7 +1469,7 @@
             return;
           }
           setQueueState('paused');
-          appendTerminalLine('[SYS] Queue paused.', 'system');
+          appendTerminalLine('[SYS] Pauza.', 'system');
         } catch (err) {
           appendTerminalLine(
             `[ERR] Pause failed: ${err.message || String(err)}`,
@@ -1496,10 +1519,7 @@
 
         try {
           await window.electronAPI.connectSerial({ path: port, baudRate });
-          appendTerminalLine(
-            `[SYS] Connecting to ${port} @ ${baudRate}...`,
-            'system',
-          );
+          appendTerminalLine(`[SYS] Připojuji ${port}…`, 'system');
         } catch (err) {
           appendTerminalLine(
             `[ERR] Failed to connect: ${err.message || String(err)}`,
@@ -1515,7 +1535,7 @@
           await window.electronAPI.disconnectSerial();
           endLiveCncToolSync();
           drawToolpath();
-          appendTerminalLine('[SYS] Disconnected serial port.', 'system');
+          appendTerminalLine('[SYS] Odpojeno.', 'system');
         } catch (err) {
           appendTerminalLine(
             `[ERR] Failed to disconnect: ${err.message || String(err)}`,
@@ -1633,6 +1653,7 @@
 
     api.onSerialData((data) => {
       if (!data || !data.line) return;
+      if (!shouldLogSerialRecv(data.line)) return;
       appendTerminalLine(`< ${data.line}`, 'recv');
     });
 
@@ -1643,8 +1664,15 @@
 
     api.onGcodeSentLine((info) => {
       if (!info || !info.line) return;
-      appendTerminalLine(`> ${info.line}`, 'sent');
-      sentCount += 1;
+      // Počítadlo jen řádky z běžící fronty programu (ne jog / $X / G10)
+      if (info.fromQueue === true) {
+        sentCount += 1;
+      }
+      // Terminál: nepsat tisíce řádků z programu; krátké systémové ($X) ano
+      const ln = String(info.line);
+      if (info.fromQueue !== true && /^\$/i.test(ln.trim())) {
+        appendTerminalLine(`> ${ln}`, 'sent');
+      }
       if (
         liveCncToolSync &&
         queueState === 'running' &&
@@ -1658,15 +1686,18 @@
 
     api.onGcodeQueueStarted((info) => {
       stopSimulation();
+      sentCount = 0;
       queuedTotal = (info && info.total) || currentGcodeLines.length;
       setQueueState('running');
     });
 
     api.onGcodeQueueComplete(() => {
       endLiveCncToolSync();
+      sentCount = 0;
+      queuedTotal = 0;
       setQueueState('idle');
       drawToolpath();
-      appendTerminalLine('[SYS] Queue complete.', 'system');
+      appendTerminalLine('[SYS] Hotovo.', 'system');
     });
 
     if (api.onGcodeAborted) {
@@ -1678,7 +1709,7 @@
         resetSimulation();
         drawToolpath();
         appendTerminalLine(
-          '[SYS] Stop — běh zrušen; fronta prázdná, můžeš znovu načíst G-code nebo jogovat. GRBL soft reset (0x18). Při Alarm odemkni ($X).',
+          '[SYS] Stop — program zastaven, fronta vynulována. Následuje $X (unlock).',
           'system',
         );
       });
@@ -1693,10 +1724,7 @@
     resizeCanvas();
     drawToolpath();
     void initCameraUi();
-    appendTerminalLine(
-      '[SYS] Ready. Connect to a GRBL device and open a G-code file.',
-      'system',
-    );
+    appendTerminalLine('[SYS] Připraveno.', 'system');
   });
 })();
 

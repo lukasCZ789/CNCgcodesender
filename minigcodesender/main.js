@@ -28,6 +28,11 @@ let lastQueueZLiftMm = 0;
 /** @type {ReturnType<typeof setInterval> | null} */
 let grblStatusPollTimer = null;
 
+/** Po Resume čekáme na <Idle> — až stroj dojede (po Hold/jog), pak inject + program */
+let awaitingResumeIdle = false;
+/** @type {ReturnType<typeof setTimeout> | null} */
+let resumeIdleFallbackTimer = null;
+
 // Buffer for assembling complete serial lines
 let serialLineBuffer = '';
 
@@ -112,6 +117,14 @@ function sendToRenderer(channel, payload) {
 }
 
 // Reset G-code queue state
+function clearResumeIdleGate() {
+  awaitingResumeIdle = false;
+  if (resumeIdleFallbackTimer != null) {
+    clearTimeout(resumeIdleFallbackTimer);
+    resumeIdleFallbackTimer = null;
+  }
+}
+
 function resetQueue() {
   gcodeQueue = [];
   currentLineIndex = 0;
@@ -119,6 +132,16 @@ function resetQueue() {
   isPaused = false;
   pendingInjectLines = [];
   lastQueueZLiftMm = 0;
+  clearResumeIdleGate();
+}
+
+/** Po statusu <Idle…> spustit další řádky fronty (po pauze + jog). */
+function tryReleaseResumeAfterIdle(statusLine) {
+  if (!awaitingResumeIdle || !isSendingQueue || isPaused) return;
+  const st = String(statusLine || '').trim();
+  if (!st.startsWith('<Idle')) return;
+  clearResumeIdleGate();
+  sendNextQueuedLine();
 }
 
 function startGrblStatusPolling() {
@@ -161,6 +184,9 @@ function pullNextGrblMessage(buf) {
 // Send next line from the G-code queue when GRBL is ready
 function sendNextQueuedLine() {
   if (!isSendingQueue || isPaused) {
+    return;
+  }
+  if (awaitingResumeIdle) {
     return;
   }
 
@@ -311,6 +337,8 @@ function attachSerialEventHandlers() {
       const line = raw.trim();
       if (!line) continue;
 
+      tryReleaseResumeAfterIdle(line);
+
       sendToRenderer('serial:data', { line });
       parseAndSendMachinePosition(line);
 
@@ -440,32 +468,28 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
     return { success: false, error: 'No G-code lines provided.' };
   }
 
-  const isNearZero = (n) => Math.abs(Number(n) || 0) <= 0.0005;
-  const hasPos = !!lastReportedPosition;
-  const atKnownZero =
-    hasPos &&
-    isNearZero(lastReportedPosition.x) &&
-    isNearZero(lastReportedPosition.y) &&
-    isNearZero(lastReportedPosition.z);
-  // Lift: vždy když neznáme pozici (žádný ještě nenačtený <?> status), nebo jsme na 0,0,0.
-  // Když GRBL hlásí jasnou pozici mimo nulu, lift nevkládat (neškubnout Z zbytečně).
-  const shouldLiftZBeforeStart = zLiftMm > 0 && (!hasPos || atKnownZero);
+  // Vždy když je v UI lift > 0 — podmínka „jen na nule“ často selhává (odchylky WPos,
+  // práce mimo 0, jiná souřadná soustava) a pak se po desce jede bez zdvihu.
+  const shouldLiftZBeforeStart = zLiftMm > 0;
 
   const zLiftCmds = shouldLiftZBeforeStart
     ? ['G91', `G0 Z${zLiftMm.toFixed(3)}`, 'G90']
     : [];
 
   const isFirstXyMotionLine = (raw) => {
-    const s = String(raw || '').trim();
+    let s = String(raw || '').trim();
+    if (!s || s.startsWith(';')) return false;
+    const semi = s.indexOf(';');
+    if (semi >= 0) s = s.slice(0, semi).trim();
     if (!s) return false;
-    if (s.startsWith(';') || s.startsWith('(')) return false;
+    s = s.replace(/\(.*?\)/g, '').trim();
+    if (!s || s.startsWith('(')) return false;
     const upper = s.toUpperCase();
-    // Don't treat coordinate-setting commands as motion
     if (/\bG10\b/.test(upper)) return false;
-    const hasX = /X\s*-?\d+(\.\d+)?/.test(upper);
-    const hasY = /Y\s*-?\d+(\.\d+)?/.test(upper);
+    // X / Y včetně G0X10 bez mezery a tvaru X.5
+    const hasX = /X\s*-?(\d+\.?\d*|\.\d+)/i.test(upper);
+    const hasY = /Y\s*-?(\d+\.?\d*|\.\d+)/i.test(upper);
     if (!hasX && !hasY) return false;
-    // Motion if explicit motion code, or modal coordinate move
     const hasMotionCode = /\bG0\b|\bG00\b|\bG1\b|\bG01\b|\bG2\b|\bG02\b|\bG3\b|\bG03\b/.test(upper);
     return hasMotionCode || hasX || hasY;
   };
@@ -491,6 +515,7 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
   isPaused = false;
   pendingInjectLines = [];
   lastQueueZLiftMm = zLiftMm;
+  clearResumeIdleGate();
 
   sendToRenderer('gcode:queueStarted', {
     total: gcodeQueue.length,
@@ -505,7 +530,15 @@ ipcMain.handle('gcode:queue', async (_event, payload) => {
 
 // IPC: pause queue
 ipcMain.handle('gcode:pause', async () => {
+  clearResumeIdleGate();
   isPaused = true;
+  if (serialPort && serialPort.isOpen) {
+    try {
+      serialPort.write(Buffer.from([0x21])); // ! feed hold — GRBL dobrzdí, plánovač se nesyncuje s PC
+    } catch {
+      // ignore
+    }
+  }
   return { success: true };
 });
 
@@ -528,11 +561,34 @@ ipcMain.handle('gcode:resume', async () => {
     pendingInjectLines.push('G91', `G0 Z${lift.toFixed(3)}`, 'G90');
   }
 
-  sendNextQueuedLine();
+  try {
+    serialPort.write(Buffer.from([0x7e])); // ~ cycle start — uvolní Hold po !
+  } catch {
+    // ignore
+  }
+
+  awaitingResumeIdle = true;
+  if (resumeIdleFallbackTimer != null) {
+    clearTimeout(resumeIdleFallbackTimer);
+  }
+  resumeIdleFallbackTimer = setTimeout(() => {
+    resumeIdleFallbackTimer = null;
+    if (awaitingResumeIdle && isSendingQueue && !isPaused) {
+      awaitingResumeIdle = false;
+      sendNextQueuedLine();
+    }
+  }, 5000);
+
+  try {
+    serialPort.write('?');
+  } catch {
+    // ignore
+  }
+
   return { success: true };
 });
 
-// IPC: stop queue — soft reset GRBL vyčistí frontu v ovladači (pohyb se zastaví)
+// IPC: stop queue — soft reset GRBL vyčistí buffer; pak $X odemkne alarm (error:9 bez $X)
 ipcMain.handle('gcode:stop', async () => {
   if (serialPort && serialPort.isOpen) {
     try {
@@ -547,6 +603,17 @@ ipcMain.handle('gcode:stop', async () => {
   }
   resetQueue();
   sendToRenderer('gcode:aborted', {});
+  if (serialPort && serialPort.isOpen) {
+    setTimeout(() => {
+      if (!serialPort || !serialPort.isOpen) return;
+      try {
+        serialPort.write('$X\n');
+        sendToRenderer('gcode:sentLine', { line: '$X', fromQueue: false });
+      } catch {
+        // ignore
+      }
+    }, 200);
+  }
   return { success: true };
 });
 
@@ -587,18 +654,12 @@ ipcMain.handle('gcode:jog', async (_event, { axis, direction, step }) => {
   const distance = Number(step) || 1.0;
   const amount = dir * distance;
 
-  // Use simple relative move (G91/G90). For more advanced setups, $J= jog could be used.
-  const cmds = [
-    'G91', // relative mode
-    `G0 ${uppercaseAxis}${amount.toFixed(3)}`, // rapid move
-    'G90', // back to absolute
-  ];
+  // $J= funguje i ve Feed Hold (po Pauze) a nemění modal G90/G21 jako starý G91/G0/G90 — méně error 9
+  const cmd = `$J=G21 G91 ${uppercaseAxis}${amount.toFixed(3)} F3000`;
 
   try {
-    for (const cmd of cmds) {
-      serialPort.write(cmd + '\n');
-      sendToRenderer('gcode:sentLine', { line: cmd, fromQueue: false });
-    }
+    serialPort.write(`${cmd}\n`);
+    sendToRenderer('gcode:sentLine', { line: cmd, fromQueue: false });
   } catch (err) {
     return {
       success: false,
