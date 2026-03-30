@@ -1002,7 +1002,7 @@
       const rotated = rotatePoint3d(dx, dy, dz);
       return {
         x: centerScreenX + rotated.x * ppm,
-        y: centerScreenY + rotated.y * ppm,
+        y: centerScreenY - rotated.y * ppm,
       };
     };
 
