@@ -498,6 +498,74 @@
         font-size: 11px;
         color: var(--muted);
       }
+
+      .toggle-label {
+        display: block;
+        margin-top: 8px;
+        margin-bottom: 2px;
+      }
+
+      .toggle-group {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 4px;
+      }
+
+      .toggle-group button {
+        flex: 1;
+        min-width: 52px;
+        padding: 6px 6px;
+        font-size: 11px;
+      }
+
+      .toggle-group button.active {
+        border-color: var(--accent);
+        background: var(--accent-soft);
+        color: var(--accent);
+      }
+
+      .probe-desc {
+        margin-top: 4px;
+        font-size: 11px;
+        color: var(--muted);
+        line-height: 1.35;
+        min-height: 2.7em;
+      }
+
+      .field-with-unit {
+        display: flex;
+        align-items: stretch;
+        gap: 0;
+        margin-top: 4px;
+        margin-bottom: 6px;
+      }
+
+      .field-with-unit input {
+        flex: 1;
+        border-radius: 6px 0 0 6px;
+        border-right: 0;
+      }
+
+      .field-with-unit .input-unit {
+        flex: 0 0 auto;
+        padding: 5px 8px;
+        font-size: 11px;
+        color: var(--muted);
+        border: 1px solid var(--border-subtle);
+        border-radius: 0 6px 6px 0;
+        background: rgba(15, 23, 42, 0.55);
+        display: inline-flex;
+        align-items: center;
+        white-space: nowrap;
+      }
+
+      #probe-panel-body.is-collapsed {
+        display: none;
+      }
+
+      #probe-collapse-btn.is-collapsed {
+        transform: rotate(-90deg);
+      }
     </style>
   </head>
   <body>
@@ -623,6 +691,100 @@
             <span><strong>X</strong>: <span id="pos-x">0.000</span></span>
             <span><strong>Y</strong>: <span id="pos-y">0.000</span></span>
             <span><strong>Z</strong>: <span id="pos-z">0.000</span></span>
+          </div>
+        </section>
+
+        <section class="panel" id="probe-panel">
+          <div class="panel-header">
+            <div class="panel-title">Sonda</div>
+            <div style="display: flex; gap: 6px; align-items: center">
+              <button
+                type="button"
+                id="probe-collapse-btn"
+                class="icon-btn"
+                title="Skrýt / zobrazit panel"
+                aria-expanded="true"
+              >
+                ▼
+              </button>
+              <div class="badge">GRBL</div>
+            </div>
+          </div>
+          <div id="probe-panel-body">
+            <label class="toggle-label">Sondu osy</label>
+            <div class="toggle-group" id="probe-axis-group" role="group" aria-label="Osa sondy">
+              <button type="button" data-probe-axis="Z" class="active">Z</button>
+              <button type="button" data-probe-axis="X">X</button>
+              <button type="button" data-probe-axis="Y">Y</button>
+            </div>
+            <div class="probe-desc" id="probe-axis-desc">Sondu osu Z</div>
+
+            <label class="toggle-label">Příkazy sondy</label>
+            <div class="toggle-group" id="probe-command-group" role="group" aria-label="Příkaz sondy">
+              <button type="button" data-probe-cmd="G38.2" class="active">G38.2</button>
+              <button type="button" data-probe-cmd="G38.3">G38.3</button>
+              <button type="button" data-probe-cmd="G38.4">G38.4</button>
+              <button type="button" data-probe-cmd="G38.5">G38.5</button>
+            </div>
+            <div class="probe-desc" id="probe-command-desc">
+              G38.2 sonda najíždí k materiálu, zastaví při kontaktu, zahlásí chybu při selhání
+            </div>
+
+            <label for="probe-depth-input">Hloubka sondy</label>
+            <div class="field-with-unit">
+              <input
+                id="probe-depth-input"
+                type="number"
+                min="0.001"
+                step="any"
+                value="70"
+              />
+              <span class="input-unit">mm</span>
+            </div>
+
+            <label for="probe-feed-input">Feedrate sondy</label>
+            <div class="field-with-unit">
+              <input
+                id="probe-feed-input"
+                type="number"
+                min="1"
+                step="any"
+                value="100"
+              />
+              <span class="input-unit">mm/min</span>
+            </div>
+
+            <label for="probe-plate-input">Tloušťka dotykové desky</label>
+            <div class="field-with-unit">
+              <input
+                id="probe-plate-input"
+                type="number"
+                min="0"
+                step="any"
+                value="0.5"
+              />
+              <span class="input-unit">mm</span>
+            </div>
+
+            <label for="probe-retract-input">Vzdálenost vrácení</label>
+            <div class="field-with-unit">
+              <input
+                id="probe-retract-input"
+                type="number"
+                min="0"
+                step="any"
+                value="10"
+              />
+              <span class="input-unit">mm</span>
+            </div>
+
+            <button type="button" id="probe-run-btn" class="primary" style="width: 100%; margin-top: 6px">
+              Sonda
+            </button>
+            <div class="hint" id="probe-hint">
+              GRBL na Arduino UNO + CNC Shield: vstup PROBE je obvykle pin A5 (SCL) a druhý vodič na
+              GND — stejně jako v dokumentaci shieldu / GRBL.
+            </div>
           </div>
         </section>
 

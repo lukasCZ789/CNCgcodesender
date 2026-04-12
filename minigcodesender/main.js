@@ -37,6 +37,10 @@ let lastQueueZLiftMm = 0;
 /** @type {ReturnType<typeof setInterval> | null} */
 let grblStatusPollTimer = null;
 
+/** Čekání na odpověď GRBL po jednom řádku (sonda) — nesmí kolidovat s frontou programu */
+/** @type {{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> | null } | null} */
+let sequentialLineWaiter = null;
+
 // Buffer for assembling complete serial lines
 let serialLineBuffer = '';
 
@@ -156,6 +160,122 @@ function stopGrblStatusPolling() {
     clearInterval(grblStatusPollTimer);
     grblStatusPollTimer = null;
   }
+}
+
+function rejectSequentialWaiter(reason) {
+  if (!sequentialLineWaiter) return;
+  const w = sequentialLineWaiter;
+  try {
+    if (w.timer) clearTimeout(w.timer);
+  } catch {
+    // ignore
+  }
+  w.timer = null;
+  sequentialLineWaiter = null;
+  w.reject(new Error(reason));
+}
+
+/**
+ * Odešle řádky jeden po druhém a po každém čeká na `ok` / `error` (jako odesílač ve CNCjs).
+ * @param {string[]} lines
+ * @param {{ perLineTimeoutMs?: number }} [opts]
+ */
+function sendGcodeLinesSequential(lines, opts = {}) {
+  const perLineTimeoutMs =
+    Number(opts.perLineTimeoutMs) > 0 ? Number(opts.perLineTimeoutMs) : 120000;
+
+  return new Promise((resolve, reject) => {
+    if (!serialPort || !serialPort.isOpen) {
+      reject(new Error('Serial port is not connected.'));
+      return;
+    }
+    if (isSendingQueue) {
+      reject(new Error('Cannot run sequential commands while a program is sending.'));
+      return;
+    }
+    if (sequentialLineWaiter) {
+      reject(new Error('Another sequential command is already in progress.'));
+      return;
+    }
+
+    const stripForSend = (raw) => {
+      let s = String(raw || '').replace(/\(.*?\)/g, '');
+      const semi = s.indexOf(';');
+      if (semi >= 0) s = s.slice(0, semi);
+      return s.trim();
+    };
+
+    /** @type {string[]} */
+    const queue = [];
+    for (const raw of lines) {
+      const cleaned = stripForSend(raw);
+      if (!cleaned) continue;
+      queue.push(cleaned);
+    }
+
+    if (!queue.length) {
+      reject(new Error('No G-code lines to send.'));
+      return;
+    }
+
+    let idx = 0;
+
+    const sendOne = () => {
+      if (idx >= queue.length) {
+        resolve({ success: true });
+        return;
+      }
+      if (!serialPort || !serialPort.isOpen) {
+        reject(new Error('Serial port closed while sending.'));
+        return;
+      }
+
+      const line = queue[idx];
+      /** @type {{ resolve: () => void; reject: (err: Error) => void; timer: ReturnType<typeof setTimeout> | null }} */
+      const waiter = {
+        resolve: () => {
+          try {
+            if (waiter.timer) clearTimeout(waiter.timer);
+          } catch {
+            // ignore
+          }
+          waiter.timer = null;
+          sequentialLineWaiter = null;
+          idx += 1;
+          sendOne();
+        },
+        reject: (err) => {
+          try {
+            if (waiter.timer) clearTimeout(waiter.timer);
+          } catch {
+            // ignore
+          }
+          waiter.timer = null;
+          sequentialLineWaiter = null;
+          reject(err);
+        },
+        timer: /** @type {ReturnType<typeof setTimeout> | null} */ (null),
+      };
+      waiter.timer = setTimeout(() => {
+        if (sequentialLineWaiter !== waiter) return;
+        waiter.reject(new Error(`Timeout waiting for GRBL after: ${line}`));
+      }, perLineTimeoutMs);
+      sequentialLineWaiter = waiter;
+
+      try {
+        serialPort.write(line + '\n', (err) => {
+          if (err) {
+            rejectSequentialWaiter(err.message || String(err));
+          }
+        });
+        sendToRenderer('gcode:sentLine', { line, fromQueue: false });
+      } catch (err) {
+        rejectSequentialWaiter(err.message || String(err));
+      }
+    };
+
+    sendOne();
+  });
 }
 
 /**
@@ -327,6 +447,7 @@ function attachSerialEventHandlers() {
   serialPort.on('close', () => {
     stopGrblStatusPolling();
     clearGrblPositionCache();
+    rejectSequentialWaiter('Serial port closed.');
     if (suppressSerialCloseBroadcast) {
       suppressSerialCloseBroadcast = false;
       return;
@@ -356,7 +477,20 @@ function attachSerialEventHandlers() {
       sendToRenderer('serial:data', { line });
       parseAndSendMachinePosition(line);
 
-      if (isSendingQueue && !isPaused) {
+      if (sequentialLineWaiter && (/^ok\b/i.test(line) || /^error\b/i.test(line))) {
+        const w = sequentialLineWaiter;
+        sequentialLineWaiter = null;
+        try {
+          clearTimeout(w.timer);
+        } catch {
+          // ignore
+        }
+        if (/^error\b/i.test(line)) {
+          w.reject(new Error(line));
+        } else {
+          w.resolve();
+        }
+      } else if (isSendingQueue && !isPaused) {
         if (/^ok\b/i.test(line) || /^error\b/i.test(line)) {
           sendNextQueuedLine();
         }
@@ -710,10 +844,32 @@ ipcMain.handle('gcode:stop', async () => {
   return { success: true };
 });
 
+// IPC: send lines sequentially with ok/error handshake (probe, etc.)
+ipcMain.handle('gcode:sendSequential', async (_event, payload) => {
+  try {
+    const lines = Array.isArray(payload)
+      ? payload
+      : payload && typeof payload === 'object' && Array.isArray(payload.lines)
+      ? payload.lines
+      : [];
+    const perLineTimeoutMs =
+      payload && typeof payload === 'object' && Number(payload.perLineTimeoutMs) > 0
+        ? Number(payload.perLineTimeoutMs)
+        : undefined;
+    await sendGcodeLinesSequential(lines, { perLineTimeoutMs });
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
 // IPC: send one-off G-code lines (not queued)
 ipcMain.handle('gcode:sendLines', async (_event, lines) => {
   if (!serialPort || !serialPort.isOpen) {
     return { success: false, error: 'Serial port is not connected.' };
+  }
+  if (sequentialLineWaiter) {
+    return { success: false, error: 'Sequential G-code is in progress (probe).' };
   }
   if (!Array.isArray(lines) || lines.length === 0) {
     return { success: false, error: 'No lines provided.' };
@@ -736,6 +892,9 @@ ipcMain.handle('gcode:sendLines', async (_event, lines) => {
 ipcMain.handle('gcode:jog', async (_event, { axis, direction, step }) => {
   if (!serialPort || !serialPort.isOpen) {
     return { success: false, error: 'Serial port is not connected.' };
+  }
+  if (sequentialLineWaiter) {
+    return { success: false, error: 'Sequential G-code is in progress (probe).' };
   }
 
   const uppercaseAxis = String(axis || '').toUpperCase();

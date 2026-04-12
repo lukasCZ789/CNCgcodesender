@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // Jogging
   sendJog: (payload) => ipcRenderer.invoke('gcode:jog', payload),
   sendGcodeLines: (lines) => ipcRenderer.invoke('gcode:sendLines', lines),
+  /** Řádky jeden po druhém s čekáním na ok/error (sonda) */
+  sendGcodeSequential: (payload) => ipcRenderer.invoke('gcode:sendSequential', payload),
 
   // Camera pop-out window
   openCameraWindow: (payload) => ipcRenderer.invoke('camera:open', payload),

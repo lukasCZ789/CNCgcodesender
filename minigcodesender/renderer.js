@@ -35,7 +35,23 @@
     cameraDeviceIdKey: 'settings.camera.deviceId',
     cameraZoomKey: 'settings.camera.zoom',
     defaultCameraZoom: 1,
+    probeAxisKey: 'settings.probe.axis',
+    probeCommandKey: 'settings.probe.command',
+    probeDepthMmKey: 'settings.probe.depthMm',
+    probeFeedMmKey: 'settings.probe.feedMm',
+    probePlateMmKey: 'settings.probe.plateMm',
+    probeRetractMmKey: 'settings.probe.retractMm',
+    probeCollapsedKey: 'settings.probe.collapsed',
+    defaultProbeAxis: 'Z',
+    defaultProbeCommand: 'G38.2',
+    defaultProbeDepthMm: 70,
+    defaultProbeFeedMm: 100,
+    defaultProbePlateMm: 0.5,
+    defaultProbeRetractMm: 10,
   };
+
+  /** Sekvence sondy (blokuje tlačítko) */
+  let probeRunning = false;
 
   const SIM_SPEED_MM_PER_SEC = 120;
   /** @type {number | null} */
@@ -226,6 +242,302 @@
       localStorage.setItem(SETTINGS.toolDiameterMmKey, String(n));
     } catch {
       // ignore
+    }
+  }
+
+  // --- Probe (Sonda) — stejná logika jako CNCjs (WCS / G10 L20) ------------
+
+  /** @param {string} cmd */
+  function probeTowardWorkpiece(cmd) {
+    const c = String(cmd || '').toUpperCase();
+    return c === 'G38.2' || c === 'G38.3';
+  }
+
+  function getActiveProbeAxis() {
+    const active = document.querySelector('#probe-axis-group button.active');
+    const v = active && active.getAttribute('data-probe-axis');
+    return v === 'X' || v === 'Y' || v === 'Z' ? v : SETTINGS.defaultProbeAxis;
+  }
+
+  function getActiveProbeCommand() {
+    const active = document.querySelector('#probe-command-group button.active');
+    const v = active && active.getAttribute('data-probe-cmd');
+    return v === 'G38.2' || v === 'G38.3' || v === 'G38.4' || v === 'G38.5'
+      ? v
+      : SETTINGS.defaultProbeCommand;
+  }
+
+  function setProbeAxisUi(axis) {
+    const ax = axis === 'X' || axis === 'Y' || axis === 'Z' ? axis : SETTINGS.defaultProbeAxis;
+    document.querySelectorAll('#probe-axis-group [data-probe-axis]').forEach((btn) => {
+      const el = /** @type {HTMLButtonElement} */ (btn);
+      const on = el.getAttribute('data-probe-axis') === ax;
+      el.classList.toggle('active', on);
+    });
+  }
+
+  function setProbeCommandUi(cmd) {
+    const c =
+      cmd === 'G38.2' || cmd === 'G38.3' || cmd === 'G38.4' || cmd === 'G38.5'
+        ? cmd
+        : SETTINGS.defaultProbeCommand;
+    document.querySelectorAll('#probe-command-group [data-probe-cmd]').forEach((btn) => {
+      const el = /** @type {HTMLButtonElement} */ (btn);
+      el.classList.toggle('active', el.getAttribute('data-probe-cmd') === c);
+    });
+  }
+
+  function updateProbeAxisDescription() {
+    const el = $('probe-axis-desc');
+    if (!el) return;
+    const ax = getActiveProbeAxis();
+    el.textContent =
+      ax === 'X' ? 'Sondu osu X' : ax === 'Y' ? 'Sondu osu Y' : 'Sondu osu Z';
+  }
+
+  function updateProbeCommandDescription() {
+    const el = $('probe-command-desc');
+    if (!el) return;
+    const cmd = getActiveProbeCommand();
+    const text =
+      cmd === 'G38.2'
+        ? 'G38.2 sonda najíždí k materiálu, zastaví při kontaktu, zahlásí chybu při selhání'
+        : cmd === 'G38.3'
+        ? 'G38.3 sonda najíždí k materiálu, zastaví při kontaktu'
+        : cmd === 'G38.4'
+        ? 'G38.4 sonda odjíždí od materiálu, zastaví při ztrátě kontaktu, zahlásí chybu při selhání'
+        : 'G38.5 sonda odjíždí od materiálu, zastaví při ztrátě kontaktu';
+    el.textContent = text;
+  }
+
+  function readProbeDepthMmFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('probe-depth-input'));
+    const n = Number(input && input.value);
+    return Number.isFinite(n) && n > 0 ? n : SETTINGS.defaultProbeDepthMm;
+  }
+
+  function readProbeFeedFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('probe-feed-input'));
+    const n = Number(input && input.value);
+    return Number.isFinite(n) && n > 0 ? n : SETTINGS.defaultProbeFeedMm;
+  }
+
+  function readProbePlateMmFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('probe-plate-input'));
+    const n = Number(input && input.value);
+    return Number.isFinite(n) && n >= 0 ? n : SETTINGS.defaultProbePlateMm;
+  }
+
+  function readProbeRetractMmFromUi() {
+    const input = /** @type {HTMLInputElement | null} */ ($('probe-retract-input'));
+    const n = Number(input && input.value);
+    return Number.isFinite(n) && n >= 0 ? n : SETTINGS.defaultProbeRetractMm;
+  }
+
+  function persistProbeSettingsFromUi() {
+    try {
+      localStorage.setItem(SETTINGS.probeAxisKey, getActiveProbeAxis());
+      localStorage.setItem(SETTINGS.probeCommandKey, getActiveProbeCommand());
+      localStorage.setItem(SETTINGS.probeDepthMmKey, String(readProbeDepthMmFromUi()));
+      localStorage.setItem(SETTINGS.probeFeedMmKey, String(readProbeFeedFromUi()));
+      localStorage.setItem(SETTINGS.probePlateMmKey, String(readProbePlateMmFromUi()));
+      localStorage.setItem(SETTINGS.probeRetractMmKey, String(readProbeRetractMmFromUi()));
+    } catch {
+      // ignore
+    }
+  }
+
+  function loadProbeSettingsIntoUi() {
+    try {
+      const ax = localStorage.getItem(SETTINGS.probeAxisKey);
+      setProbeAxisUi(ax || SETTINGS.defaultProbeAxis);
+      const cmd = localStorage.getItem(SETTINGS.probeCommandKey);
+      setProbeCommandUi(cmd || SETTINGS.defaultProbeCommand);
+
+      const depth = Number(localStorage.getItem(SETTINGS.probeDepthMmKey));
+      const feed = Number(localStorage.getItem(SETTINGS.probeFeedMmKey));
+      const plate = Number(localStorage.getItem(SETTINGS.probePlateMmKey));
+      const ret = Number(localStorage.getItem(SETTINGS.probeRetractMmKey));
+
+      const di = /** @type {HTMLInputElement | null} */ ($('probe-depth-input'));
+      const fi = /** @type {HTMLInputElement | null} */ ($('probe-feed-input'));
+      const pi = /** @type {HTMLInputElement | null} */ ($('probe-plate-input'));
+      const ri = /** @type {HTMLInputElement | null} */ ($('probe-retract-input'));
+      if (di) di.value = String(Number.isFinite(depth) && depth > 0 ? depth : SETTINGS.defaultProbeDepthMm);
+      if (fi) fi.value = String(Number.isFinite(feed) && feed > 0 ? feed : SETTINGS.defaultProbeFeedMm);
+      if (pi) pi.value = String(Number.isFinite(plate) && plate >= 0 ? plate : SETTINGS.defaultProbePlateMm);
+      if (ri) ri.value = String(Number.isFinite(ret) && ret >= 0 ? ret : SETTINGS.defaultProbeRetractMm);
+    } catch {
+      setProbeAxisUi(SETTINGS.defaultProbeAxis);
+      setProbeCommandUi(SETTINGS.defaultProbeCommand);
+    }
+    updateProbeAxisDescription();
+    updateProbeCommandDescription();
+  }
+
+  function loadProbeCollapsedIntoUi() {
+    const body = $('probe-panel-body');
+    const btn = $('probe-collapse-btn');
+    if (!body || !btn) return;
+    let collapsed = false;
+    try {
+      collapsed = localStorage.getItem(SETTINGS.probeCollapsedKey) === '1';
+    } catch {
+      collapsed = false;
+    }
+    body.classList.toggle('is-collapsed', collapsed);
+    btn.classList.toggle('is-collapsed', collapsed);
+    btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  }
+
+  function persistProbeCollapsed(collapsed) {
+    try {
+      localStorage.setItem(SETTINGS.probeCollapsedKey, collapsed ? '1' : '0');
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * G-kódy jako CNCjs (výchozí větev bez TLO): G91 → G38.x → G90 → G10 L20 → retrakt.
+   * WCS mapování: aplikace jinak používá G54 → P1 (viz setWorkZero).
+   */
+  function buildCncjsStyleProbeLines() {
+    const axis = getActiveProbeAxis();
+    const command = getActiveProbeCommand();
+    const depth = readProbeDepthMmFromUi();
+    const feed = readProbeFeedFromUi();
+    const touchPlate = readProbePlateMmFromUi();
+    const retract = readProbeRetractMmFromUi();
+    const sign = probeTowardWorkpiece(command) ? -1 : 1;
+    const travel = sign * depth;
+    const p = 1; // G54
+    return [
+      `; ${axis}-Probe`,
+      'G91',
+      `${command} ${axis}${travel.toFixed(3)} F${feed.toFixed(3)}`,
+      'G90',
+      `; Set the active WCS ${axis}0`,
+      `G10 L20 P${p} ${axis}${touchPlate.toFixed(3)}`,
+      '; Retract from the touch plate',
+      'G91',
+      `G0 ${axis}${retract.toFixed(3)}`,
+      'G90',
+    ];
+  }
+
+  function syncProbeRunButton() {
+    const btn = $('probe-run-btn');
+    if (!btn) return;
+    const api = window.electronAPI;
+    const hasSeq = !!(api && typeof api.sendGcodeSequential === 'function');
+    const ok =
+      hasSeq &&
+      serialConnected &&
+      queueState === 'idle' &&
+      !probeRunning;
+    /** @type {HTMLButtonElement} */ (btn).disabled = !ok;
+  }
+
+  async function runProbeSequence() {
+    const api = window.electronAPI;
+    if (!api || typeof api.sendGcodeSequential !== 'function') {
+      appendTerminalLine('[ERR] Sonda: chybí IPC sendGcodeSequential.', 'error');
+      return;
+    }
+    if (!serialConnected || queueState !== 'idle' || probeRunning) return;
+
+    probeRunning = true;
+    syncProbeRunButton();
+    const lines = buildCncjsStyleProbeLines();
+    appendTerminalLine('[SYS] Sonda (WCS / G10 L20 jako CNCjs)…', 'system');
+    for (const ln of lines) {
+      if (String(ln).trim().startsWith(';')) {
+        appendTerminalLine(`> ${ln}`, 'sent');
+      }
+    }
+    try {
+      const res = await api.sendGcodeSequential({ lines, perLineTimeoutMs: 120000 });
+      if (!res || res.success === false) {
+        appendTerminalLine(
+          `[ERR] Sonda: ${(res && res.error) || 'neznámá chyba'}`,
+          'error',
+        );
+        return;
+      }
+      appendTerminalLine('[SYS] Sonda dokončena.', 'system');
+      persistProbeSettingsFromUi();
+    } catch (err) {
+      appendTerminalLine(`[ERR] Sonda: ${err.message || String(err)}`, 'error');
+    } finally {
+      probeRunning = false;
+      syncProbeRunButton();
+    }
+  }
+
+  function wireProbePanel() {
+    loadProbeSettingsIntoUi();
+    loadProbeCollapsedIntoUi();
+    syncProbeRunButton();
+
+    const axisGroup = $('probe-axis-group');
+    if (axisGroup) {
+      axisGroup.addEventListener('click', (e) => {
+        const t = /** @type {HTMLElement} */ (e.target);
+        const btn = t.closest && t.closest('[data-probe-axis]');
+        if (!btn) return;
+        const ax = btn.getAttribute('data-probe-axis');
+        if (ax !== 'X' && ax !== 'Y' && ax !== 'Z') return;
+        setProbeAxisUi(ax);
+        updateProbeAxisDescription();
+        persistProbeSettingsFromUi();
+      });
+    }
+
+    const cmdGroup = $('probe-command-group');
+    if (cmdGroup) {
+      cmdGroup.addEventListener('click', (e) => {
+        const t = /** @type {HTMLElement} */ (e.target);
+        const btn = t.closest && t.closest('[data-probe-cmd]');
+        if (!btn) return;
+        const cmd = btn.getAttribute('data-probe-cmd');
+        if (cmd !== 'G38.2' && cmd !== 'G38.3' && cmd !== 'G38.4' && cmd !== 'G38.5') return;
+        setProbeCommandUi(cmd);
+        updateProbeCommandDescription();
+        persistProbeSettingsFromUi();
+      });
+    }
+
+    const inputs = [
+      'probe-depth-input',
+      'probe-feed-input',
+      'probe-plate-input',
+      'probe-retract-input',
+    ];
+    for (const id of inputs) {
+      const el = /** @type {HTMLInputElement | null} */ ($(id));
+      if (!el) continue;
+      el.addEventListener('change', persistProbeSettingsFromUi);
+      el.addEventListener('blur', persistProbeSettingsFromUi);
+    }
+
+    const runBtn = $('probe-run-btn');
+    if (runBtn) {
+      runBtn.addEventListener('click', () => {
+        void runProbeSequence();
+      });
+    }
+
+    const collapseBtn = $('probe-collapse-btn');
+    const body = $('probe-panel-body');
+    if (collapseBtn && body) {
+      collapseBtn.addEventListener('click', () => {
+        const next = !body.classList.contains('is-collapsed');
+        body.classList.toggle('is-collapsed', next);
+        collapseBtn.classList.toggle('is-collapsed', next);
+        collapseBtn.setAttribute('aria-expanded', next ? 'false' : 'true');
+        persistProbeCollapsed(next);
+      });
     }
   }
 
@@ -513,6 +825,8 @@
       connectBtn.disabled = !!connected;
       disconnectBtn.disabled = !connected;
     }
+
+    syncProbeRunButton();
   }
 
   function setQueueState(newState) {
@@ -550,6 +864,8 @@
         stopBtn.disabled = false;
       }
     }
+
+    syncProbeRunButton();
   }
 
   function updateMachinePosition(pos) {
@@ -1916,6 +2232,8 @@
     if (z0Btn) {
       z0Btn.addEventListener('click', () => void goToWorkZero('z'));
     }
+
+    wireProbePanel();
   }
 
   // --- IPC event listeners from main process -------------------------------
